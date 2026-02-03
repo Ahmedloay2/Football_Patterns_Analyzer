@@ -29,9 +29,9 @@ We analyze football (soccer) match event data to identify tactical patterns thro
 ### Technology Stack Rationale
 - **Python 3.8+**: Type hints, dataclasses, modern syntax
 - **NumPy**: Vectorized operations for performance
-- **Pandas**: Structured data manipulation
+- **Pandas**: CSV export for results
 - **SciPy**: Hierarchical clustering implementation
-- **Matplotlib**: Publication-quality visualizations
+- **Matplotlib**: Field visualizations in GUI
 - **Tkinter**: Cross-platform GUI without external dependencies
 
 ---
@@ -43,16 +43,16 @@ We analyze football (soccer) match event data to identify tactical patterns thro
 #### Single Responsibility Principle (SRP)
 Each module has one clear purpose:
 ```
-data_loader.py    → Parse JSON, extract plays
-feature_engineer.py → Transform plays into feature vectors
-clustering.py     → Group similar plays, name clusters
-visualizer.py     → Generate field plots
-browser.py        → File selection dialog
-utils.py          → Shared utilities
-config.py         → Configuration management
-models.py         → Data structures
-main.py           → Orchestration
-gui_app.py        → User interface
+data_loader.py    → Parse JSON, extract plays (EventParser, PlayExtractor, DataLoader)
+feature_engineer.py → Engineer spatial and tactical features
+clustering.py     → Cluster plays and analyze patterns (PlayClusterer, ClusterAnalyzer)
+visualizer.py     → Generate field visualizations
+browser.py        → Interactive play browser (PlayBrowser)
+utils.py          → Helper functions (normalize coords, feature vectors)
+config.py         → Configuration (AnalysisConfig, PathConfig)
+models.py         → Data structures (PlayEvent, Play, MatchMetadata)
+main.py           → Pipeline orchestration (TacticalAnalyzer)
+gui_app.py        → Tkinter GUI interface
 ```
 
 #### Open/Closed Principle (OCP)
@@ -147,14 +147,22 @@ Named clusters with plays
 ```
 Clustered Plays
   ↓
-Export to CSV (all_plays.csv, cluster_analysis.csv)
+Analyze cluster characteristics (ClusterAnalyzer)
   ↓
-Export to JSON (detailed_clusters.json)
+Export to CSV (cluster_analysis.csv only)
   ↓
-Generate summary statistics
+Generate cluster names and statistics
   ↓
-Launch GUI for interactive exploration
+Launch GUI for interactive exploration (optional)
 ```
+
+**Output file**: `output/cluster_analysis.csv` contains:
+- cluster_id
+- pattern_name
+- total_plays
+- goals, shots, losses
+- avg_duration, avg_forward_progress
+- avg_events, wing_plays
 
 ---
 
@@ -166,19 +174,18 @@ Given a sequence of football match events, identify **meaningful attacking plays
 ### Definition of a Valid Play
 A play must satisfy ALL of these conditions:
 
-1. **Initiation**: Starts with a forward pass (y_end > y_start)
-2. **Continuation**: Contains at least 2 passes by the same team
-3. **Pass Types**: Passes can be:
-   - PA (Pass Accurate)
-   - CR (Cross Accurate)
-   - Any pass type that successfully maintains possession
+1. **Initiation**: Starts with a forward pass (PA event type)
+2. **Forward Direction**: First pass must move ball forward in attack direction
+3. **Continuation**: Contains at least 2 passes (PA or CR events) by the same team
 4. **Termination**: Ends with a terminal event:
    - SH (Shot) - attacking attempt
    - LO (Loss Offensive) - possession lost
-   - CA (Clearance) - defensive action by opponent
-   - TA (Tackle) - defensive action by opponent
+   - CA (Clearance) - defensive action
+   - TA (Tackle) - defensive action
    - Team change - opponent gains possession
-5. **Team Consistency**: All passes must be by the same team
+5. **Team Consistency**: All events must be by the same team until termination
+6. **Duration**: Must be between 3-30 seconds (configurable)
+7. **Forward Progress**: After normalization, must have minimum forward progress (>5.0 units, configurable)
 
 ### Algorithm Implementation
 
@@ -262,19 +269,19 @@ def _try_extract_play(self, events: List[Event], start_idx: int) -> Optional[Pla
 
 ### Examples
 
-#### Example 1: Valid Play (3 passes, ends in goal)
+#### Example 1: Valid Play (3 passes, ends in shot)
 ```
-Event 1: PA (Pass) - Team A, y: 20→35 (forward)
-Event 2: PA (Pass) - Team A, y: 35→50
-Event 3: PA (Pass) - Team A, y: 50→65
-Event 4: SH (Shot) - Team A, GOAL!
+Event 1: PA (Pass) - Team A, forward=true
+Event 2: PA (Pass) - Team A  
+Event 3: CR (Cross) - Team A
+Event 4: SH (Shot) - Team A
 
-Result: ✅ Valid play (3 passes + terminal event)
+Result: ✅ Valid play (3 passes: PA+PA+CR, terminal: SH)
 ```
 
 #### Example 2: Invalid Play (only 1 pass)
 ```
-Event 1: PA (Pass) - Team A, y: 20→35 (forward)
+Event 1: PA (Pass) - Team A, forward=true
 Event 2: SH (Shot) - Team A
 
 Result: ❌ Invalid (only 1 pass, need 2+)
@@ -282,18 +289,18 @@ Result: ❌ Invalid (only 1 pass, need 2+)
 
 #### Example 3: Valid Play (2 passes, possession lost)
 ```
-Event 1: PA (Pass) - Team A, y: 25→40 (forward)
-Event 2: CR (Cross) - Team A, y: 40→60
-Event 3: PA (Pass) - Team A, y: 60→65
-Event 4: Event - Team B (possession changed)
+Event 1: PA (Pass) - Team A, forward=true
+Event 2: PA (Pass) - Team A
+Event 3: IT (Touch) - Team A
+Event 4: Event - Team B (team changed)
 
-Result: ✅ Valid play (2 passes + team change)
+Result: ✅ Valid play (2 passes, terminal: team change)
 ```
 
-#### Example 4: Invalid Play (backward start)
+#### Example 4: Invalid Play (not forward)
 ```
-Event 1: PA (Pass) - Team A, y: 50→30 (backward)
-Event 2: PA (Pass) - Team A, y: 30→45
+Event 1: PA (Pass) - Team A, forward=false (backward pass)
+Event 2: PA (Pass) - Team A
 Event 3: SH (Shot) - Team A
 
 Result: ❌ Invalid (first pass not forward)
@@ -312,250 +319,111 @@ Result: ❌ Invalid (first pass not forward)
 ## Feature Engineering - Mathematical Foundation
 
 ### Feature Vector Composition
-Each play is transformed into a 13-dimensional feature vector:
-```
-v = [x₁, y₁, x₂, y₂, Δx, Δy, d, t, s, w, f, p, g]
+Each play is transformed into a **17-dimensional feature vector** (as detailed above).
+
+The features focus on:
+1. **Event sequence** - What types of actions occurred (8 event type counts)
+2. **Spatial dynamics** - Movement patterns and distances (6 spatial features)  
+3. **Tactical context** - Player positioning (3 tactical features)
+
+**Example feature vector**:
+```python
+play = Play(...)
+vector = get_feature_vector(play)
+# Returns: [2, 1, 0, 1, 0, 0, 0, 0,  # Event counts
+#           45.2, 12.3, 52.0, 68.4, 6, 8.2,  # Spatial
+#           3.5, 4.2, 0.0]  # Tactical
 ```
 
 ### Feature Definitions
 
-#### 1. start_x (x₁)
-**Definition**: X-coordinate where play begins  
-**Range**: [0, 105] meters  
-**Formula**: 
-```
-x₁ = first_event.location_x
-```
-**Tactical Meaning**: 
-- x₁ < 35: Deep defensive play
-- 35 ≤ x₁ < 70: Midfield build-up
-- x₁ ≥ 70: High-pressing play
+#### Feature Vector Structure
 
-**Example**:
+The actual feature vector consists of **17 dimensions**:
+
+**Event Type Counts (8 dimensions)**:
+- PA (Pass Accurate) count
+- SH (Shot) count  
+- CR (Cross) count
+- IT (Interception/Touch) count
+- LO (Loss Offensive) count
+- CA (Clearance) count
+- DR (Dribble) count
+- TC (Touch) count
+
+**Spatial Features (6 dimensions)**:
+- delta_x: Forward progression (end_x - start_x)
+- delta_y: Lateral movement |end_y - start_y|
+- max_x: Maximum forward penetration
+- total_distance: Cumulative ball movement
+- num_events: Number of events in play
+- duration: Time elapsed (seconds)
+
+**Tactical Features (3 dimensions)**:
+- avg_attackers_ahead: Mean attacking players ahead of ball
+- avg_defenders_ahead: Mean defending players ahead of ball
+- wing_indicator: 1.0 if wing play, 0.0 if central
+
+#### Coordinate System
+
+**Note**: The actual coordinate system used in this implementation is NOT the standard StatsBomb 105m × 68m field. Instead:
+
+- Coordinates are extracted from event JSON with `ball_x` and `ball_y` fields
+- Coordinate ranges depend on the data provider format
+- All plays are **normalized** to attack from left-to-right for clustering consistency
+- Wing detection threshold: `|ball_y| > 15` indicates wing play
+- Forward threshold: `ball_x > previous_ball_x + 1.0` indicates forward movement
+
+#### Actual Feature Calculations
+
+**From feature_engineer.py**:
+
 ```python
-Event 1: location_x=25.0 → start_x = 25.0
+def _process_play(self, play: Play) -> None:
+    # Normalize coordinates to right-attacking direction
+    play.normalized_events = normalize_coordinates_to_right(
+        play.events, 
+        play.original_attack_direction
+    )
+    
+    events = play.normalized_events
+    
+    # Spatial features
+    play.delta_x = events[-1].ball_x - events[0].ball_x  # Forward progress
+    play.delta_y = abs(events[-1].ball_y - events[0].ball_y)  # Lateral movement
+    play.max_x = max(e.ball_x for e in events)  # Maximum penetration
+    
+    # Total distance (cumulative movement)
+    total = 0.0
+    for i in range(len(events) - 1):
+        dx = events[i+1].ball_x - events[i].ball_x
+        dy = events[i+1].ball_y - events[i].ball_y
+        total += sqrt(dx*dx + dy*dy)
+    play.total_distance = total
+    
+    # Tactical features
+    play.avg_attackers_ahead = mean([e.attacking_players_ahead for e in events])
+    play.avg_defenders_ahead = mean([e.defending_players_ahead for e in events])
+    play.wing_side = 'WING' if mean([abs(e.ball_y) for e in events]) > 15 else 'CENTER'
 ```
 
-#### 2. start_y (y₁)
-**Definition**: Y-coordinate where play begins  
-**Range**: [0, 68] meters  
-**Formula**: 
-```
-y₁ = first_event.location_y
-```
-**Tactical Meaning**:
-- y₁ < 17: Right flank
-- 17 ≤ y₁ < 51: Central corridor
-- y₁ ≥ 51: Left flank
+### Feature Engineering Details
 
-#### 3. end_x (x₂)
-**Definition**: X-coordinate where play ends  
-**Range**: [0, 105] meters  
-**Formula**: 
-```
-x₂ = last_event.location_x
-```
-**Tactical Meaning**: Measures vertical progression
+**Actual features** (from `utils.py` - `get_feature_vector()`):
 
-#### 4. end_y (y₂)
-**Definition**: Y-coordinate where play ends  
-**Range**: [0, 68] meters  
-**Formula**: 
-```
-y₂ = last_event.location_y
-```
-**Tactical Meaning**: Measures lateral movement
+1. **Event Type Counts** (8 features): PA, SH, CR, IT, LO, CA, DR, TC
+2. **Spatial Features** (6 features): delta_x, delta_y, max_x, total_distance, num_events, duration
+3. **Tactical Features** (3 features): avg_attackers_ahead, avg_defenders_ahead, wing_indicator (1.0 or 0.0)
 
-#### 5. distance_covered (d)
-**Definition**: Euclidean distance from start to end  
-**Range**: [0, ~115] meters (diagonal of field)  
-**Formula**: 
-```
-d = √[(x₂ - x₁)² + (y₂ - y₁)²]
-```
-**Tactical Meaning**:
-- d < 20: Short combination play
-- 20 ≤ d < 40: Medium progression
-- d ≥ 40: Long direct play
+**Total**: 17 features per play
 
-**Example**:
-```python
-start: (25, 34), end: (75, 60)
-d = √[(75-25)² + (60-34)²]
-  = √[2500 + 676]
-  = √3176
-  = 56.4 meters
-```
+**Normalization**: Features are used in raw form (not standardized). Ward's linkage naturally handles different scales.
 
-#### 6. vertical_progression (Δx)
-**Definition**: Net forward movement  
-**Range**: [-105, 105] meters  
-**Formula**: 
-```
-Δx = x₂ - x₁
-```
-**Tactical Meaning**:
-- Δx < 0: Regression/recycling possession
-- Δx ≈ 0: Lateral circulation
-- Δx > 0: Positive progression
-- Δx > 40: Penetrating attack
-
-**Example**:
-```python
-start_x=25, end_x=75 → Δx = 50 (deep penetration)
-```
-
-#### 7. lateral_movement (Δy)
-**Definition**: Net sideways movement  
-**Range**: [-68, 68] meters  
-**Formula**: 
-```
-Δy = y₂ - y₁
-```
-**Tactical Meaning**:
-- Δy < -20: Right-to-left switch
-- -20 ≤ Δy ≤ 20: Central play
-- Δy > 20: Left-to-right switch
-
-#### 8. duration (t)
-**Definition**: Time elapsed from first to last event  
-**Range**: [0, ~∞) seconds (practically < 60s)  
-**Formula**: 
-```
-t = last_event.timestamp - first_event.timestamp
-```
-**Tactical Meaning**:
-- t < 5s: Quick transition/counter
-- 5 ≤ t < 15s: Medium tempo build-up
-- t ≥ 15s: Patient possession play
-
-**Example**:
-```python
-first_timestamp = 125.3s
-last_timestamp = 138.7s
-t = 138.7 - 125.3 = 13.4 seconds
-```
-
-#### 9. avg_speed (s)
-**Definition**: Average progression speed  
-**Range**: [0, ~21] m/s (Usain Bolt speed)  
-**Formula**: 
-```
-s = d / t  (if t > 0, else 0)
-```
-**Tactical Meaning**:
-- s < 2 m/s: Slow build-up
-- 2 ≤ s < 5 m/s: Medium tempo
-- s ≥ 5 m/s: Fast break
-
-**Example**:
-```python
-d = 56.4m, t = 13.4s
-s = 56.4 / 13.4 = 4.2 m/s
-```
-
-#### 10. wing_percentage (w)
-**Definition**: Proportion of play in wide areas  
-**Range**: [0, 1]  
-**Formula**: 
-```
-wing_events = count(events where y < 17 OR y > 51)
-w = wing_events / total_events
-```
-**Tactical Meaning**:
-- w < 0.3: Central play
-- 0.3 ≤ w < 0.7: Mixed play
-- w ≥ 0.7: Wide play
-
-**Example**:
-```python
-Events: [(x, y), ...]
-Event 1: (30, 10) → y < 17 → wing ✓
-Event 2: (45, 34) → 17 ≤ y ≤ 51 → central ✗
-Event 3: (60, 55) → y > 51 → wing ✓
-Event 4: (75, 60) → y > 51 → wing ✓
-
-w = 3/4 = 0.75 (wide play)
-```
-
-#### 11. forward_pass_percentage (f)
-**Definition**: Proportion of passes moving forward  
-**Range**: [0, 1]  
-**Formula**: 
-```
-forward_passes = count(passes where end_x > start_x)
-f = forward_passes / total_passes
-```
-**Tactical Meaning**:
-- f < 0.4: Backward/lateral circulation
-- 0.4 ≤ f < 0.7: Mixed progression
-- f ≥ 0.7: Direct vertical play
-
-**Example**:
-```python
-Pass 1: x: 25→40 (forward) ✓
-Pass 2: x: 40→38 (backward) ✗
-Pass 3: x: 38→65 (forward) ✓
-
-f = 2/3 = 0.67
-```
-
-#### 12. num_passes (p)
-**Definition**: Total number of passes in play  
-**Range**: [2, ~∞) (minimum 2 by definition)  
-**Formula**: 
-```
-p = count(events of type PA or CR)
-```
-**Tactical Meaning**:
-- p = 2-3: Direct play
-- p = 4-6: Medium complexity
-- p ≥ 7: Elaborate build-up
-
-#### 13. ended_in_goal (g)
-**Definition**: Binary outcome indicator  
-**Range**: {0, 1}  
-**Formula**: 
-```
-g = 1 if last_event.type_name == 'SH' AND last_event.is_goal else 0
-```
-**Tactical Meaning**: Success metric for pattern effectiveness
-
-### Feature Normalization
-
-Features are used in their **raw form** without normalization because:
-
-1. **Hierarchical clustering with Ward's method** is based on variance minimization
-2. **Physical units have meaning**: A 50m progression is objectively different from a 5m progression
-3. **Distance threshold** becomes interpretable in original feature space
-4. **Cluster interpretability**: Statistics like "avg vertical_progression: 45m" are meaningful
-
-However, features naturally have different scales:
-- Coordinates: [0, 105] × [0, 68]
-- Duration: [0, ~60]
-- Percentages: [0, 1]
-- Binary: {0, 1}
-
-**Impact on clustering**: Features with larger scales (coordinates, distance) have more influence on distance calculations. This is acceptable because spatial characteristics are the most important distinguishing factors for tactical patterns.
-
-**Alternative approach** (not used):
-```python
-from sklearn.preprocessing import StandardScaler
-
-scaler = StandardScaler()
-features_normalized = scaler.fit_transform(features)
-# Each feature: mean=0, std=1
-```
-
-### Feature Correlation Analysis
-
-Expected correlations:
-- **distance_covered ↔ vertical_progression**: Strong positive (r ≈ 0.8)
-- **duration ↔ num_passes**: Moderate positive (r ≈ 0.6)
-- **wing_percentage ↔ lateral_movement**: Moderate positive (r ≈ 0.5)
-- **forward_pass_percentage ↔ vertical_progression**: Strong positive (r ≈ 0.75)
-
-These correlations are expected and represent real tactical relationships.
+**Why these features?**
+- Event type sequence captures tactical approach (passing vs crossing vs dribbling)
+- Spatial features capture movement patterns and penetration
+- Tactical features capture numerical advantage and positioning
+- Outcome (goal/shot) is NOT included in features - clustering based on pattern, not result
 
 ---
 
@@ -744,19 +612,23 @@ Each cluster gets a descriptive name based on its tactical characteristics:
 
 ### Component Definitions
 
-#### 1. Position (Wing vs Center)
+#### 1. Position (Wing vs Central vs Mixed)
 ```python
-wing_pct = mean([play.wing_percentage for play in cluster_plays])
+wing_plays = sum(1 for p in cluster_plays if p.wing_side == 'WING')
+wing_pct = wing_plays / len(cluster_plays)
 
-if wing_pct >= 0.6:
-    position = "Wing"
+if wing_pct >= 0.7:
+    position = "Wing Attack"
+elif wing_pct <= 0.3:
+    position = "Central Attack"
 else:
-    position = "Center"
+    position = "Mixed Attack"
 ```
 
 **Threshold rationale**: 
-- 0.6 means 60% of play events occur in wide areas
-- Represents clear tactical intent to use flanks
+- 70% wing plays → Wing Attack
+- 30% or less wing plays → Central Attack
+- Between 30-70% → Mixed Attack
 
 #### 2. Category
 ```python
@@ -765,22 +637,22 @@ category = "Attack"  # Fixed, as we only analyze attacking plays
 
 **Future extension**: Could distinguish "Counter", "Set-piece", "Possession"
 
-#### 3. Speed (Fast vs Medium vs Slow)
+#### 3. Speed & Length
 ```python
 avg_duration = mean([play.duration for play in cluster_plays])
 
-if avg_duration < 8.0:
+if avg_duration < 5.0:
     speed = "Fast"
-elif avg_duration < 15.0:
-    speed = "Medium"
+elif avg_duration > 10.0:
+    speed = "Slow Build"
 else:
-    speed = "Slow"
+    speed = "Medium"
 ```
 
 **Thresholds**:
-- **< 8s**: Quick transitions, counter-attacks
-- **8-15s**: Normal tempo build-up
-- **≥ 15s**: Patient possession play
+- **< 5s**: Fast - Quick transitions, counter-attacks
+- **5-10s**: Medium - Normal tempo build-up  
+- **> 10s**: Slow Build - Patient possession play
 
 **Example**:
 ```
@@ -790,20 +662,20 @@ Mean: 7.04s → "Fast"
 
 #### 4. Depth (Short vs Mid vs Deep)
 ```python
-avg_forward = mean([play.vertical_progression for play in cluster_plays])
+avg_forward = mean([play.delta_x for play in cluster_plays])
 
-if avg_forward < 20.0:
-    depth = "Short"
-elif avg_forward < 40.0:
+if avg_forward > 30:
+    depth = "Deep"
+elif avg_forward > 20:
     depth = "Mid"
 else:
-    depth = "Deep"
+    depth = "Short"
 ```
 
 **Thresholds**:
-- **< 20m**: Low-risk, short passes
-- **20-40m**: Moderate penetration
-- **≥ 40m**: Deep, threatening attacks
+- **> 30 units**: Deep - Threatening attacks
+- **20-30 units**: Mid - Moderate penetration
+- **< 20 units**: Short - Low-risk, short progression
 
 **Physical interpretation**:
 - Field length: 105m
@@ -815,55 +687,58 @@ A 40m progression typically spans from defensive to attacking third.
 
 #### 5. Conversion (High-Conv vs Low-Conv)
 ```python
-goal_rate = sum([play.ended_in_goal for play in cluster_plays]) / len(cluster_plays)
+goals = sum(1 for p in cluster_plays if p.is_goal)
+success_rate = goals / len(cluster_plays) if len(cluster_plays) >= 2 else 0
 
-if goal_rate >= 0.15:  # 15% conversion
+if success_rate >= 0.3:  # 30% conversion
     conversion = "High-Conv"
+elif success_rate > 0:
+    conversion = "Low-Conv"
 else:
-    conversion = ""  # Omitted for brevity
+    conversion = ""  # Omitted
 ```
 
 **Threshold rationale**:
-- Professional football: ~10-12% shot conversion rate
-- 15% represents above-average effectiveness
-- Only highlighted when notably high
+- 30% represents high effectiveness (goals scored)
+- Shows Low-Conv if any goals but < 30%
+- Only shows conversion info when cluster has 2+ plays
 
 ### Complete Naming Examples
 
-#### Example 1: Wing Fast Deep High-Conv
+#### Example 1: Wing Attack Fast Deep High-Conv
 ```python
 Cluster statistics:
-- wing_pct: 0.72 → "Wing" (72% wide play)
-- avg_duration: 6.8s → "Fast" 
-- avg_forward: 48.3m → "Deep"
-- goal_rate: 0.18 → "High-Conv" (18% scored)
+- wing_plays: 11/15 = 0.73 → "Wing Attack" (>70%)
+- avg_duration: 4.2s → "Fast" (<5s)
+- avg_forward: 35.8 → "Deep" (>30)
+- goals: 5/15 = 0.33 → "High-Conv" (≥30%)
 
 Name: "Wing Attack Fast Deep High-Conv"
 Interpretation: Quick wide attacks with deep penetration, highly effective
 ```
 
-#### Example 2: Center Medium Mid
+#### Example 2: Central Attack Medium Mid Low-Conv
 ```python
 Cluster statistics:
-- wing_pct: 0.35 → "Center" (35% wide play)
-- avg_duration: 12.4s → "Medium"
-- avg_forward: 28.7m → "Mid"
-- goal_rate: 0.09 → "" (9%, below threshold)
+- wing_plays: 3/22 = 0.14 → "Central Attack" (<30%)
+- avg_duration: 8.4s → "Medium" (5-10s)
+- avg_forward: 24.7 → "Mid" (20-30)
+- goals: 2/22 = 0.09 → "Low-Conv" (>0 but <30%)
 
-Name: "Center Attack Medium Mid"
+Name: "Central Attack Medium Mid Low-Conv"
 Interpretation: Patient central build-up with moderate progression
 ```
 
-#### Example 3: Wing Slow Short
+#### Example 3: Mixed Attack Slow Build Short
 ```python
 Cluster statistics:
-- wing_pct: 0.68 → "Wing"
-- avg_duration: 18.2s → "Slow"
-- avg_forward: 15.3m → "Short"
-- goal_rate: 0.05 → ""
+- wing_plays: 8/18 = 0.44 → "Mixed Attack" (30-70%)
+- avg_duration: 12.2s → "Slow Build" (>10s)
+- avg_forward: 16.3 → "Short" (<20)
+- goals: 0/18 = 0.00 → "" (no conversion shown)
 
-Name: "Wing Attack Slow Short"
-Interpretation: Patient wide possession with limited penetration
+Name: "Mixed Attack Slow Build Short"
+Interpretation: Patient possession with limited penetration, using both flanks and center
 ```
 
 ### Naming Code Implementation
@@ -978,20 +853,21 @@ ComparisonWindow (comparison dialog)
 
 #### Initialization
 ```python
-class TacticalAnalyzerGUI:
-    def __init__(self, analyzer: Optional[TacticalAnalyzer] = None):
+class TacticalAnalysisGUI:
+    def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Tactical Play Analyzer")
-        self.root.geometry("1000x800")
+        self.root.title("Football Tactical Pattern Analysis")
+        self.root.geometry("1200x800")
         
-        self.analyzer = analyzer
-        self.plays_by_cluster: Dict[int, List[Play]] = {}
-        self.cluster_names: Dict[int, str] = {}
+        self.analyzer = None
+        self.browser = None
+        self.current_cluster = None
         
-        self._setup_ui()
+        self.setup_ui()
+        self.load_data()
 ```
 
-**Design decision**: Accept optional `analyzer` parameter for dependency injection, enabling testing and flexibility.
+**Design decision**: Automatically runs analysis on startup (`load_data()` called in `__init__`), providing immediate results.
 
 #### UI Layout
 ```python
@@ -1062,70 +938,54 @@ def _setup_ui(self):
 
 ### Analysis Workflow
 
-#### Step 1: Folder Selection
+#### Step 1: Auto-Load on Startup
 ```python
-def cmd_analyze(self):
-    folder_path = select_folder_dialog()
-    if not folder_path:
+def load_data(self):
+    """Load and analyze data automatically on startup."""
+    self.print_output("Loading data and running analysis...\n")
+    self.status_var.set("Loading data...")
+    
+    # Create analyzer and run full pipeline
+    self.analyzer = TacticalAnalyzer()
+    results = self.analyzer.run_analysis()
+    
+    # Populate cluster dropdown
+    cluster_options = []
+    for cluster_id, analysis in self.analyzer.cluster_analysis.items():
+        total = analysis['total']
+        name = analysis['name']
+        cluster_options.append(f"Cluster {cluster_id}: {name} ({total} plays)")
+    
+    self.cluster_combo['values'] = cluster_options
+    if cluster_options:
+        self.cluster_combo.current(0)
+        self.on_cluster_selected(None)
+```
+
+**Threading consideration**: Analysis runs in main thread (blocking UI) - acceptable because analysis typically completes in < 5 seconds.
+
+#### Step 2: Cluster Selection and Browser Creation
+```python
+def on_cluster_selected(self, event):
+    """Handle cluster selection - creates PlayBrowser for selected cluster."""
+    selection = self.cluster_var.get()
+    if not selection:
         return
     
-    self.status_label.config(text=f"Analyzing {folder_path}...")
-    self.root.update()  # Force UI refresh
+    # Extract cluster number from "Cluster 1: Name (N plays)"
+    cluster_id = int(selection.split(':')[0].replace('Cluster ', ''))
+    self.current_cluster = cluster_id
     
-    try:
-        self._run_analysis(folder_path)
-    except Exception as e:
-        messagebox.showerror("Error", str(e))
-        self.status_label.config(text="Error occurred")
+    # Create browser for this cluster
+    self.browser = self.analyzer.create_browser(cluster_id)
+    
+    # Show initial info
+    cluster_name = self.analyzer.cluster_analysis.get(cluster_id, {}).get('name', 'Unknown')
+    self.clear_output()
+    self.print_output(f"Selected: Cluster {cluster_id}: {cluster_name}\n")
 ```
 
-**Threading consideration**: Analysis runs in main thread (blocking UI) because:
-1. Provides immediate feedback
-2. Prevents race conditions
-3. Analysis typically < 5 seconds
-4. More complex threading not justified for this use case
-
-**Alternative (threaded)**:
-```python
-import threading
-
-def cmd_analyze(self):
-    folder_path = select_folder_dialog()
-    if not folder_path:
-        return
-    
-    thread = threading.Thread(
-        target=self._run_analysis,
-        args=(folder_path,),
-        daemon=True
-    )
-    thread.start()
-```
-
-#### Step 2: Run Analysis
-```python
-def _run_analysis(self, folder_path: str):
-    # Create analyzer if needed
-    if self.analyzer is None:
-        self.analyzer = TacticalAnalyzer()
-    
-    # Execute pipeline
-    self.analyzer.analyze_folder(folder_path)
-    
-    # Extract results
-    self.plays_by_cluster = {}
-    self.cluster_names = {}
-    
-    for cluster_id, cluster_data in self.analyzer.clusters.items():
-        self.plays_by_cluster[cluster_id] = cluster_data['plays']
-        self.cluster_names[cluster_id] = cluster_data['name']
-    
-    # Update UI
-    self._populate_cluster_dropdown()
-    self.status_label.config(
-        text=f"Analysis complete: {len(self.plays_by_cluster)} clusters found"
-    )
-```
+**PlayBrowser**: Provides commands like `list()`, `summary()`, `compare(idx1, idx2)`, `visualize(idx)` for exploring plays within a cluster.
 
 #### Step 3: Populate Dropdown
 ```python
@@ -1177,27 +1037,51 @@ def cmd_visualize(self):
 - `FigureCanvasTkAgg`: Tkinter widget wrapping Figure
 - `canvas.draw()`: Render updated plot
 
-### Comparison Window
+### Browser Commands
 
-#### Window Creation
+#### List Command
 ```python
-def cmd_compare(self):
-    selections = self.play_listbox.curselection()
-    if len(selections) != 2:
-        messagebox.showwarning(
-            "Invalid Selection",
-            "Please select exactly 2 plays (Ctrl+Click)"
-        )
+def cmd_list(self):
+    """Execute list command via PlayBrowser."""
+    if not self.browser:
+        messagebox.showwarning("Warning", "Please select a cluster first")
         return
     
-    # Get plays
-    cluster_id = self._get_selected_cluster_id()
-    play1 = self.plays_by_cluster[cluster_id][selections[0]]
-    play2 = self.plays_by_cluster[cluster_id][selections[1]]
+    # Capture stdout from browser.list()
+    old_stdout = sys.stdout
+    sys.stdout = mystdout = StringIO()
     
-    # Create comparison window
-    self._create_comparison_window(play1, play2)
+    try:
+        self.browser.list()  # Calls PlayBrowser.list()
+        output = mystdout.getvalue()
+        self.print_output(output)
+    finally:
+        sys.stdout = old_stdout
 ```
+
+#### Compare Command
+```python
+def cmd_compare(self):
+    """Compare two plays using indices."""
+    try:
+        idx1 = int(self.play1_var.get())
+        idx2 = int(self.play2_var.get())
+        
+        # Capture output from browser
+        old_stdout = sys.stdout
+        sys.stdout = mystdout = StringIO()
+        
+        self.browser.compare(idx1, idx2)
+        
+        output = mystdout.getvalue()
+        self.print_output(output)
+    except ValueError:
+        messagebox.showerror("Error", "Please enter valid play numbers")
+    finally:
+        sys.stdout = old_stdout
+```
+
+**Note**: The GUI uses `PlayBrowser` class which provides the actual comparison logic and visualization.
 
 #### Compact Single-Window Design
 ```python
@@ -1603,15 +1487,17 @@ Play: Forward pass → 3 passes → shot
 **Decision**: Use JSON files as input format
 
 **Rationale**:
-1. **Industry standard**: StatsBomb, Opta, Wyscout use JSON
-2. **Human-readable**: Easy to inspect and debug
-3. **Flexible**: Nested structures for complex data
+1. **Common format**: Many sports data providers use JSON
+2. **Human-readable**: Easy to inspect and debug  
+3. **Flexible**: Nested structures for complex event data
 4. **Python support**: Built-in `json` module
 
-**Alternatives**:
-- **CSV**: Flat structure, harder for nested data
-- **Database**: Overkill for analysis workflow
-- **Binary**: Faster but not human-readable
+**Event Structure**:
+Each event contains:
+- `possessionEvents`: Event type (PA, SH, CR, etc.) and player info
+- `gameEvents`: Team info, time, match metadata
+- `ball`: Ball position (x, y coordinates)
+- `homePlayers`, `awayPlayers`: Player positions for tactical analysis
 
 ### 8. Why Separate Visualizer Class?
 
@@ -1643,206 +1529,231 @@ viz.plot_play(play, ax=ax)
 
 ```python
 from src.main import TacticalAnalyzer
-from src.config import Config
+from src.config import AnalysisConfig
+from pathlib import Path
 
-# Step 1: Configure
-config = Config(
-    distance_threshold=12.0,
-    min_passes=2,
-    output_dir='output'
+# Step 1: Configure (optional - has defaults)
+config = AnalysisConfig(
+    clustering_threshold=12.0,
+    min_forward_progress=5.0,
+    min_play_duration=3.0,
+    max_play_duration=30.0
 )
 
 # Step 2: Create analyzer
-analyzer = TacticalAnalyzer(config=config)
+analyzer = TacticalAnalyzer(
+    data_dir=Path('Event Data'),
+    config=config
+)
 
-# Step 3: Analyze folder
-analyzer.analyze_folder('Event Data')
+# Step 3: Run analysis
+results = analyzer.run_analysis()
 
 # Step 4: Access results
-for cluster_id, cluster_data in analyzer.clusters.items():
-    name = cluster_data['name']
-    plays = cluster_data['plays']
-    stats = cluster_data['statistics']
+for cluster_id, plays in analyzer.clusters.items():
+    analysis = analyzer.cluster_analysis[cluster_id]
     
-    print(f"{cluster_id}. {name}")
-    print(f"   Plays: {len(plays)}")
-    print(f"   Avg Duration: {stats['avg_duration']:.1f}s")
-    print(f"   Avg Progression: {stats['avg_progression']:.1f}m")
-    print(f"   Goal Rate: {stats['goal_rate']:.1%}")
-    print()
+    print(f"\nCluster {cluster_id}: {analysis['name']}")
+    print(f"  Total plays: {analysis['total']}")
+    print(f"  Goals: {analysis['goals']}, Shots: {analysis['shots']}")
+    print(f"  Avg Duration: {analysis['avg_duration']:.1f}s")
+    print(f"  Avg Forward Progress: {analysis['avg_forward']:.1f}")
+    print(f"  Wing plays: {analysis['wing_plays']}/{analysis['total']}")
+
+# Step 5: Create browser for interactive exploration
+browser = analyzer.create_browser(cluster_id=1)
+browser.list()  # List all plays in cluster 1
+browser.summary()  # Show cluster statistics
+browser.compare(1, 2)  # Compare plays 1 and 2
 ```
 
 **Output**:
 ```
-1. Wing Attack Fast Deep High-Conv
-   Plays: 15
-   Avg Duration: 6.8s
-   Avg Progression: 48.3m
-   Goal Rate: 18.0%
+Cluster 1: Wing Attack Fast Deep High-Conv
+  Total plays: 15
+  Goals: 5, Shots: 12
+  Avg Duration: 4.2s
+  Avg Forward Progress: 35.8
+  Wing plays: 11/15
 
-2. Center Attack Medium Mid
-   Plays: 22
-   Avg Duration: 12.4s
-   Avg Progression: 28.7m
-   Goal Rate: 9.1%
-
+Cluster 2: Central Attack Medium Mid Low-Conv
+  Total plays: 22
+  Goals: 2, Shots: 8
+  Avg Duration: 8.4s
+  Avg Forward Progress: 24.7
+  Wing plays: 3/22
 ...
 ```
 
-### Example 2: Custom Feature Extraction
+### Example 2: Adding Custom Features
 
-**Scenario**: Add new feature for "pass accuracy"
+**Scenario**: Add average pass length as a new feature
 
 ```python
-# In feature_engineer.py
+# In utils.py - modify get_feature_vector()
 
-def extract_features(self, plays: List[Play]) -> np.ndarray:
+def get_feature_vector(play: Play) -> np.ndarray:
     features = []
     
-    for play in plays:
-        # Existing 13 features
-        basic_features = [
-            self._start_x(play),
-            self._start_y(play),
-            # ... more features
-        ]
-        
-        # NEW FEATURE: Pass accuracy
-        pass_accuracy = self._calculate_pass_accuracy(play)
-        
-        # Combine
-        features.append(basic_features + [pass_accuracy])
+    # Existing event type counts (8 features)
+    event_types = ['PA', 'SH', 'CR', 'IT', 'LO', 'CA', 'DR', 'TC']
+    event_counts = {et: 0 for et in event_types}
+    for event in play.normalized_events:
+        if event.event_type in event_counts:
+            event_counts[event.event_type] += 1
+    features.extend([event_counts[et] for et in event_types])
+    
+    # Existing spatial features (6 features)
+    features.extend([
+        play.delta_x,
+        play.delta_y,
+        play.max_x,
+        play.total_distance,
+        play.num_events,
+        play.duration
+    ])
+    
+    # Existing tactical features (3 features)
+    features.extend([
+        play.avg_attackers_ahead,
+        play.avg_defenders_ahead,
+        1.0 if play.wing_side == 'WING' else 0.0
+    ])
+    
+    # NEW FEATURE: Average pass length
+    avg_pass_length = calculate_avg_pass_length(play)
+    features.append(avg_pass_length)
     
     return np.array(features)
 
-def _calculate_pass_accuracy(self, play: Play) -> float:
-    """Calculate percentage of accurate passes."""
-    passes = [e for e in play.events if e.type_name in ['PA', 'CR']]
-    if not passes:
+def calculate_avg_pass_length(play: Play) -> float:
+    """Calculate average distance per pass."""
+    if play.num_events < 2:
         return 0.0
-    
-    accurate = [e for e in passes if e.outcome == 'Accurate']
-    return len(accurate) / len(passes)
+    return play.total_distance / (play.num_events - 1)
 ```
 
-**Impact**: Now clustering considers pass accuracy (14th feature)
+**Impact**: Now feature vector has 18 dimensions, clustering will consider pass length patterns.
 
-### Example 3: Alternative Clustering Method
+### Example 2: Re-analyzing with Different Threshold
 
-**Scenario**: Use K-Means instead of hierarchical
+**Scenario**: Try different clustering thresholds to find optimal granularity
 
 ```python
-# In clustering.py
+from src.main import TacticalAnalyzer
 
-from sklearn.cluster import KMeans
+analyzer = TacticalAnalyzer()
+results = analyzer.run_analysis()  # Initial analysis
 
-class KMeansClusterer:
-    def __init__(self, n_clusters: int = 10):
-        self.n_clusters = n_clusters
-    
-    def cluster_plays(
-        self,
-        plays: List[Play],
-        features: np.ndarray
-    ) -> Dict[int, List[Play]]:
-        # Run K-Means
-        kmeans = KMeans(
-            n_clusters=self.n_clusters,
-            random_state=42,
-            n_init=10
-        )
-        labels = kmeans.fit_predict(features)
-        
-        # Group plays by cluster
-        clusters = {}
-        for cluster_id in range(self.n_clusters):
-            mask = labels == cluster_id
-            clusters[cluster_id + 1] = [
-                plays[i] for i in range(len(plays)) if mask[i]
-            ]
-        
-        return clusters
+print(f"Initial: {len(analyzer.clusters)} clusters with threshold=12.0")
+
+# Try tighter clustering (more specific patterns)
+analyzer.reanalyze_with_threshold(8.0)
+print(f"Threshold=8.0: {len(analyzer.clusters)} clusters (more specific)")
+
+# Try looser clustering (more general patterns)
+analyzer.reanalyze_with_threshold(15.0)
+print(f"Threshold=15.0: {len(analyzer.clusters)} clusters (more general)")
+
+# Compare cluster distributions
+for cluster_id, plays in analyzer.clusters.items():
+    print(f"Cluster {cluster_id}: {len(plays)} plays")
 ```
 
-**Usage**:
-```python
-# In main.py
-from clustering import KMeansClusterer
+**Output**:
+```
+Initial: 10 clusters with threshold=12.0
+Threshold=8.0: 18 clusters (more specific)
+Threshold=15.0: 6 clusters (more general)
 
-analyzer = TacticalAnalyzer(
-    clusterer=KMeansClusterer(n_clusters=12)
-)
+Cluster 1: 25 plays
+Cluster 2: 18 plays
+Cluster 3: 12 plays
+...
 ```
 
-### Example 4: Filtering Plays by Criteria
+### Example 3: Filtering Plays by Outcome
 
 **Scenario**: Only analyze plays that ended in shots
 
 ```python
-# In main.py, after loading plays
+from src.main import TacticalAnalyzer
 
-def filter_plays_by_outcome(
-    plays: List[Play],
-    outcome_type: str
-) -> List[Play]:
-    """Filter plays by their outcome event type."""
-    return [
-        play for play in plays
-        if play.events[-1].type_name == outcome_type
-    ]
+analyzer = TacticalAnalyzer()
+results = analyzer.run_analysis()
 
-# Usage
-all_plays = data_loader.load_folder('Event Data')
-shot_plays = filter_plays_by_outcome(all_plays, 'SH')
+# Filter plays by outcome
+def filter_by_outcome(clusters, outcome_type):
+    """Filter plays in all clusters by outcome."""
+    filtered = {}
+    for cluster_id, plays in clusters.items():
+        filtered_plays = [
+            p for p in plays 
+            if p.outcome == outcome_type
+        ]
+        if filtered_plays:  # Only include non-empty clusters
+            filtered[cluster_id] = filtered_plays
+    return filtered
 
-print(f"Total plays: {len(all_plays)}")
-print(f"Shot plays: {len(shot_plays)}")
+# Get only shot plays
+shot_clusters = filter_by_outcome(analyzer.clusters, 'SHOT')
+goal_clusters = filter_by_outcome(analyzer.clusters, 'GOAL')
 
-# Cluster only shot plays
-features = feature_engineer.extract_features(shot_plays)
-clusters = clusterer.cluster_plays(shot_plays, features)
+print(f"Shot plays: {sum(len(p) for p in shot_clusters.values())}")
+print(f"Goal plays: {sum(len(p) for p in goal_clusters.values())}")
+
+# Analyze goal-scoring patterns
+for cluster_id, plays in goal_clusters.items():
+    analysis = analyzer.cluster_analysis[cluster_id]
+    print(f"{analysis['name']}: {len(plays)} goals")
 ```
 
-### Example 5: Exporting Plays to Video Timestamps
+### Example 4: Exporting Video Timestamps
 
-**Scenario**: Generate video clips for each cluster
+**Scenario**: Generate timestamp file for creating video clips
 
 ```python
-def export_video_timestamps(
-    clusters: Dict[int, Dict],
-    output_file: str
-):
-    """Export timestamp ranges for video clipping."""
-    with open(output_file, 'w') as f:
-        f.write("cluster_id,cluster_name,play_id,start_time,end_time\n")
+import csv
+from src.main import TacticalAnalyzer
+
+analyzer = TacticalAnalyzer()
+results = analyzer.run_analysis()
+
+# Export timestamps
+with open('output/video_timestamps.csv', 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        'cluster_id', 'cluster_name', 'play_id', 
+        'match_name', 'team', 'start_time', 'end_time',
+        'start_clock', 'end_clock', 'video_url'
+    ])
+    
+    for cluster_id, plays in analyzer.clusters.items():
+        analysis = analyzer.cluster_analysis[cluster_id]
+        cluster_name = analysis['name']
         
-        for cluster_id, data in clusters.items():
-            name = data['name']
-            plays = data['plays']
-            
-            for play in plays:
-                start_time = play.events[0].timestamp
-                end_time = play.events[-1].timestamp
-                
-                # Add 2-second buffer
-                start_time = max(0, start_time - 2.0)
-                end_time += 2.0
-                
-                f.write(
-                    f"{cluster_id},{name},{play.play_id},"
-                    f"{start_time:.1f},{end_time:.1f}\n"
-                )
+        for play in plays:
+            writer.writerow([
+                cluster_id,
+                cluster_name,
+                play.play_id,
+                play.match_name,
+                play.team_name,
+                f"{play.start_time:.1f}s",
+                f"{play.end_time:.1f}s",
+                play.start_time_display,  # MM:SS format
+                play.end_time_display,    # MM:SS format
+                play.video_url
+            ])
 
-# Usage
-export_video_timestamps(analyzer.clusters, 'output/timestamps.csv')
+print("Video timestamps exported to output/video_timestamps.csv")
 ```
 
-**Output (timestamps.csv)**:
+**Output CSV**:
 ```
-cluster_id,cluster_name,play_id,start_time,end_time
-1,Wing Attack Fast Deep,play_23,123.3,137.1
-1,Wing Attack Fast Deep,play_45,256.8,268.4
-2,Center Attack Medium Mid,play_12,89.2,104.6
+cluster_id,cluster_name,play_id,match_name,team,start_time,end_time,start_clock,end_clock,video_url
+1,Wing Attack Fast Deep,M3815_T123_T125,Team A vs Team B,Team A,125.0s,133.2s,02:05,02:13,http://...
+1,Wing Attack Fast Deep,M3816_T123_T256,Team A vs Team B,Team A,256.8s,264.4s,04:16,04:24,http://...
 ...
 ```
 
@@ -2069,53 +1980,50 @@ def _try_extract_play(self, events, start_idx):
 
 import unittest
 from src.data_loader import PlayExtractor
-from src.models import Event
+from src.models import PlayEvent, MatchMetadata
 
 class TestPlayExtraction(unittest.TestCase):
     def setUp(self):
-        self.extractor = PlayExtractor(min_passes=2)
+        self.extractor = PlayExtractor()
+        self.metadata = MatchMetadata(
+            match_id=1,
+            match_name="Test Match",
+            home_team="Team A",
+            away_team="Team B",
+            file_path="test.json"
+        )
     
     def test_valid_play_two_passes(self):
-        """Play with 2 passes should be extracted."""
+        """Play with 2 PA passes should be extracted."""
         events = [
-            Event(type_name='PA', team_id='A', location_x=20, location_y=34, 
-                  timestamp=10.0, ...),
-            Event(type_name='PA', team_id='A', location_x=40, location_y=38, 
-                  timestamp=12.0, ...),
-            Event(type_name='SH', team_id='A', location_x=80, location_y=34, 
-                  timestamp=14.0, ...)
+            self._create_event('PA', 1, 10, forward=True),
+            self._create_event('PA', 1, 20),
+            self._create_event('SH', 1, 30)
         ]
         
-        plays = self.extractor.extract_plays(events)
+        plays = self.extractor.extract_plays(events, self.metadata)
         
         self.assertEqual(len(plays), 1)
-        self.assertEqual(len(plays[0].events), 3)
+        self.assertGreaterEqual(len(plays[0].events), 2)
     
     def test_invalid_play_one_pass(self):
         """Play with only 1 pass should be rejected."""
         events = [
-            Event(type_name='PA', team_id='A', location_x=20, location_y=34, 
-                  timestamp=10.0, ...),
-            Event(type_name='SH', team_id='A', location_x=80, location_y=34, 
-                  timestamp=12.0, ...)
+            self._create_event('PA', 1, 10, forward=True),
+            self._create_event('SH', 1, 20)
         ]
         
-        plays = self.extractor.extract_plays(events)
+        plays = self.extractor.extract_plays(events, self.metadata)
         
         self.assertEqual(len(plays), 0)
     
-    def test_team_change_ends_play(self):
-        """Team change should end play."""
-        events = [
-            Event(type_name='PA', team_id='A', ...),
-            Event(type_name='PA', team_id='A', ...),
-            Event(type_name='PA', team_id='B', ...)  # Team changed
-        ]
-        
-        plays = self.extractor.extract_plays(events)
-        
-        self.assertEqual(len(plays), 1)
-        self.assertEqual(len(plays[0].events), 2)  # Only team A events
+    def _create_event(self, event_type, team_id, x, forward=False):
+        """Helper to create test events."""
+        return {
+            'possessionEvents': {'possessionEventType': event_type},
+            'gameEvents': {'teamId': team_id, 'homeTeam': True, 'period': 1},
+            'ball': [{'x': x, 'y': 0}]
+        }
 ```
 
 #### Test Feature Engineering
@@ -2124,36 +2032,41 @@ class TestPlayExtraction(unittest.TestCase):
 
 import numpy as np
 from src.feature_engineer import FeatureEngineer
-from src.models import Play, Event
+from src.models import Play, PlayEvent
 
 class TestFeatureEngineer(unittest.TestCase):
-    def test_vertical_progression(self):
-        """Test vertical progression calculation."""
-        play = Play(events=[
-            Event(location_x=20, location_y=34, ...),
-            Event(location_x=60, location_y=40, ...)
-        ])
+    def test_delta_x_calculation(self):
+        """Test forward progression calculation."""
+        play = Play(
+            events=[
+                PlayEvent(event_type='PA', ball_x=20, ball_y=0, time=10, ...),
+                PlayEvent(event_type='PA', ball_x=60, ball_y=0, time=15, ...)
+            ],
+            original_attack_direction='R',
+            ...
+        )
         
         engineer = FeatureEngineer()
-        features = engineer.extract_features([play])
+        engineer._process_play(play)
         
-        # Feature index 4 is vertical_progression
-        self.assertAlmostEqual(features[0, 4], 40.0)  # 60 - 20
+        self.assertAlmostEqual(play.delta_x, 40.0)  # 60 - 20
     
-    def test_wing_percentage(self):
-        """Test wing percentage calculation."""
-        play = Play(events=[
-            Event(location_x=20, location_y=10, ...),  # Wing (y < 17)
-            Event(location_x=40, location_y=34, ...),  # Center
-            Event(location_x=60, location_y=60, ...),  # Wing (y > 51)
-            Event(location_x=80, location_y=55, ...)   # Wing
-        ])
+    def test_wing_side_detection(self):
+        """Test wing vs center classification."""
+        # Wing play (|avg_y| > 15)
+        wing_play = Play(
+            events=[
+                PlayEvent(event_type='PA', ball_x=20, ball_y=20, ...),
+                PlayEvent(event_type='PA', ball_x=40, ball_y=18, ...)
+            ],
+            original_attack_direction='R',
+            ...
+        )
         
         engineer = FeatureEngineer()
-        features = engineer.extract_features([play])
+        engineer._process_play(wing_play)
         
-        # Feature index 9 is wing_percentage
-        self.assertAlmostEqual(features[0, 9], 0.75)  # 3/4
+        self.assertEqual(wing_play.wing_side, 'WING')
 ```
 
 ### Integration Testing
@@ -2162,40 +2075,42 @@ class TestFeatureEngineer(unittest.TestCase):
 # tests/test_integration.py
 
 import os
-import tempfile
+from pathlib import Path
 from src.main import TacticalAnalyzer
-from src.config import Config
+from src.config import AnalysisConfig
 
 class TestIntegration(unittest.TestCase):
     def test_full_pipeline(self):
         """Test complete analysis pipeline."""
         # Use test data folder
-        test_folder = 'tests/test_data'
+        test_folder = Path('tests/test_data')
         
-        config = Config(
-            distance_threshold=12.0,
-            min_passes=2,
-            output_dir=tempfile.mkdtemp()
+        config = AnalysisConfig(
+            clustering_threshold=12.0,
+            min_forward_progress=5.0
         )
         
-        analyzer = TacticalAnalyzer(config=config)
-        analyzer.analyze_folder(test_folder)
+        analyzer = TacticalAnalyzer(
+            data_dir=test_folder,
+            config=config
+        )
+        results = analyzer.run_analysis()
         
         # Verify outputs
         self.assertGreater(len(analyzer.clusters), 0)
         
-        for cluster_id, cluster_data in analyzer.clusters.items():
-            self.assertIn('name', cluster_data)
-            self.assertIn('plays', cluster_data)
-            self.assertIn('statistics', cluster_data)
-            self.assertGreater(len(cluster_data['plays']), 0)
+        for cluster_id, plays in analyzer.clusters.items():
+            self.assertGreater(len(plays), 0)
+            # Each play should have cluster assignment
+            for play in plays:
+                self.assertEqual(play.cluster_id, cluster_id)
         
-        # Verify files created
+        # Verify cluster analysis exists
+        self.assertIsNotNone(analyzer.cluster_analysis)
+        
+        # Verify CSV output created
         self.assertTrue(
-            os.path.exists(f"{config.output_dir}/all_plays.csv")
-        )
-        self.assertTrue(
-            os.path.exists(f"{config.output_dir}/cluster_analysis.csv")
+            os.path.exists(analyzer.paths.cluster_csv)
         )
 ```
 
