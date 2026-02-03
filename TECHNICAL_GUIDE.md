@@ -75,23 +75,23 @@ app = TacticalAnalyzerGUI(analyzer=analyzer)
 ### Module Dependency Graph
 ```
 main.py
-  ├─→ config.py (Config dataclass)
+  ├─→ config.py (AnalysisConfig, PathConfig)
   ├─→ data_loader.py
-  │     ├─→ models.py (Event, Play)
+  │     ├─→ models.py (PlayEvent, Play, MatchMetadata)
   │     └─→ utils.py
   ├─→ feature_engineer.py
-  │     └─→ models.py (Play)
+  │     ├─→ models.py (Play, PlayEvent)
+  │     └─→ utils.py
   ├─→ clustering.py
   │     ├─→ models.py (Play)
+  │     ├─→ utils.py (get_feature_vector)
   │     └─→ config.py
   ├─→ visualizer.py
-  │     └─→ models.py (Event, Play)
+  │     └─→ models.py (Play, PlayEvent)
   └─→ browser.py
 
 gui_app.py
-  ├─→ main.py (TacticalAnalyzer)
-  ├─→ visualizer.py
-  └─→ models.py
+  └─→ main.py (TacticalAnalyzer)
 ```
 
 ---
@@ -102,45 +102,56 @@ gui_app.py
 ```
 JSON Files (Event Data/*.json)
   ↓
-EventParser.parse_file()
+DataLoader.load_all_matches()
   ↓
-List[Event] objects with normalized coordinates
+For each JSON file:
+  EventParser.parse_event() for each raw event
   ↓
-PlayExtractor.extract_plays()
+  List[PlayEvent] objects
   ↓
-List[Play] objects (filtered sequences)
+  PlayExtractor.extract_plays(events, metadata)
+  ↓
+  List[Play] objects (2+ passes, terminal event, duration 3-30s)
+  ↓
+All plays from all matches + MatchMetadata dict
 ```
 
 ### Stage 2: Feature Extraction
 ```
 List[Play]
   ↓
-FeatureEngineer.extract_features()
+FeatureEngineer.engineer_features(plays)
   ↓
 For each play:
-  - Calculate geometric features (start_x, end_y, etc.)
-  - Calculate temporal features (duration, speed)
-  - Calculate tactical features (wing_pct, forward_pct)
-  - Calculate outcome features (ended_in_goal)
+  - Normalize coordinates to right-attacking direction
+  - Calculate spatial features (delta_x, delta_y, max_x, total_distance)
+  - Calculate tactical features (avg_attackers_ahead, avg_defenders_ahead, wing_side)
+  - Duration and num_events already set during play creation
   ↓
-2D NumPy array (n_plays × 13_features)
+Updated List[Play] with features
+  ↓
+get_feature_vector(play) extracts 17D numpy array per play
 ```
 
 ### Stage 3: Clustering
 ```
-Feature Matrix (n × 13)
+List[Play] with features
+  ↓
+PlayClusterer.cluster_plays(plays)
+  ↓
+Filter plays: delta_x >= min_forward_progress (5.0)
+  ↓
+Extract feature matrix (n × 17) using get_feature_vector()
   ↓
 scipy.cluster.hierarchy.linkage(method='ward')
   ↓
-Dendrogram (hierarchical structure)
+fcluster(t=clustering_threshold, criterion='distance')
   ↓
-fcluster(t=distance_threshold)
+Group plays by cluster_id, filter clusters with <2 plays
   ↓
-Cluster labels for each play
+Sort by cluster size, renumber 1..N
   ↓
-_generate_cluster_name() for each cluster
-  ↓
-Named clusters with plays
+OrderedDict[cluster_id → List[Play]]
 ```
 
 ### Stage 4: Output Generation
@@ -223,46 +234,57 @@ State 3: Validate play
 Return Play or None
 ```
 
-#### Detailed Implementation
+#### Detailed Implementation 
 ```python
-def _try_extract_play(self, events: List[Event], start_idx: int) -> Optional[Play]:
-    # State 0: Find forward pass
-    if not self._is_forward_pass(events[start_idx]):
+def _try_extract_play(self, events: List[Dict], start_idx: int,
+                     metadata: MatchMetadata, stadium_meta: Dict) -> Optional[tuple]:
+    # State 0: Must start with PA (pass) event
+    first_event = events[start_idx]
+    poss_event = first_event.get('possessionEvents', {})
+    if poss_event.get('possessionEventType') != 'PA':
         return None
     
-    team_id = events[start_idx].team_id
-    play_events = [events[start_idx]]
-    pass_count = 1
+    # Check if first pass is forward
+    if not self._is_pass_forward(first_event, events, start_idx, ...):
+        return None
     
-    # State 1: Accumulate passes
-    idx = start_idx + 1
-    while idx < len(events):
+    team_id = first_event.get('gameEvents', {}).get('teamId')
+    play_events = []  # List of PlayEvent objects
+    pass_events = []  # Track PA/CR events
+    
+    # State 1: Collect events from same team
+    for idx in range(start_idx, len(events)):
         event = events[idx]
+        event_team = event.get('gameEvents', {}).get('teamId')
+        event_type = event.get('possessionEvents', {}).get('possessionEventType')
         
-        # Team change = terminal condition
-        if event.team_id != team_id:
-            break
+        # Team change = terminal
+        if event_team != team_id:
+            if len(pass_events) >= 2:
+                break
+            else:
+                return None
         
-        # Terminal event types
-        if event.type_name in ['SH', 'LO', 'CA', 'TA']:
-            play_events.append(event)
-            break
+        # Parse and add event
+        play_event = self.event_parser.parse_event(event, ...)
+        if play_event:
+            play_events.append(play_event)
         
-        # Valid pass types
-        if event.type_name in ['PA', 'CR']:
-            play_events.append(event)
-            pass_count += 1
+        # Track passes
+        if event_type in ['PA', 'CR']:
+            pass_events.append(event)
         
-        idx += 1
+        # Terminal events
+        if event_type in ['SH', 'LO', 'CA', 'TA']:
+            if len(pass_events) >= 2:
+                break
+            else:
+                return None
     
-    # State 3: Validate
-    if pass_count >= 2:
-        return Play(
-            play_id=f"play_{start_idx}",
-            events=play_events,
-            team_id=team_id,
-            match_id=events[start_idx].match_id
-        )
+    # State 3: Validate and create Play object
+    if len(pass_events) >= 2:
+        play = self._create_play(play_events, first_event, last_event, metadata, ...)
+        return (play, next_idx) if play else None
     
     return None
 ```
@@ -557,7 +579,7 @@ Higher silhouette score (closer to 1) = better-defined clusters.
 ### Clustering Example
 
 **Dataset**: 50 plays  
-**Features**: 13-dimensional vectors  
+**Features**: 17-dimensional vectors  
 **Threshold**: 12.0
 
 **Step-by-step**:
@@ -744,56 +766,57 @@ Interpretation: Patient possession with limited penetration, using both flanks a
 ### Naming Code Implementation
 
 ```python
-def _generate_cluster_name(
-    self,
-    cluster_id: int,
-    cluster_plays: List[Play]
-) -> str:
-    """Generate descriptive name based on cluster characteristics."""
+def _generate_cluster_name(self, plays: List[Play]) -> str:
+    """Generate descriptive name for cluster based on tactical patterns."""
+    total = len(plays)
     
-    # Calculate statistics
-    wing_pcts = [self._calculate_wing_percentage(p) for p in cluster_plays]
-    durations = [self._calculate_duration(p) for p in cluster_plays]
-    forward_progressions = [
-        p.events[-1].location_x - p.events[0].location_x 
-        for p in cluster_plays
-    ]
-    goals = [
-        1 if (p.events[-1].type_name == 'SH' and p.events[-1].is_goal) else 0
-        for p in cluster_plays
-    ]
+    # Wing preference
+    wing_plays = sum(1 for p in plays if p.wing_side == 'WING')
+    wing_pct = wing_plays / total if total > 0 else 0
     
-    # Compute means
-    avg_wing = np.mean(wing_pcts)
-    avg_duration = np.mean(durations)
-    avg_forward = np.mean(forward_progressions)
-    goal_rate = np.mean(goals)
+    # Outcome analysis
+    goals = sum(1 for p in plays if p.is_goal)
     
-    # Build name components
-    position = "Wing" if avg_wing >= 0.6 else "Center"
+    # Distance metrics
+    avg_forward = np.mean([p.delta_x for p in plays])
+    avg_duration = np.mean([p.duration for p in plays])
     
-    if avg_duration < 8.0:
-        speed = "Fast"
-    elif avg_duration < 15.0:
-        speed = "Medium"
+    # Build cluster name
+    name_parts = []
+    
+    # Attack position
+    if wing_pct >= 0.7:
+        name_parts.append("Wing Attack")
+    elif wing_pct <= 0.3:
+        name_parts.append("Central Attack")
     else:
-        speed = "Slow"
+        name_parts.append("Mixed Attack")
     
-    if avg_forward < 20.0:
-        depth = "Short"
-    elif avg_forward < 40.0:
-        depth = "Mid"
+    # Speed & length
+    if avg_duration < 5:
+        name_parts.append("Fast")
+    elif avg_duration > 10:
+        name_parts.append("Slow Build")
     else:
-        depth = "Deep"
+        name_parts.append("Medium")
     
-    conversion = "High-Conv" if goal_rate >= 0.15 else ""
+    # Penetration
+    if avg_forward > 30:
+        name_parts.append("Deep")
+    elif avg_forward > 20:
+        name_parts.append("Mid")
+    else:
+        name_parts.append("Short")
     
-    # Assemble name
-    parts = [position, "Attack", speed, depth]
-    if conversion:
-        parts.append(conversion)
+    # Success rate
+    if total >= 2:
+        success_rate = goals / total
+        if success_rate >= 0.3:
+            name_parts.append("High-Conv")
+        elif success_rate > 0:
+            name_parts.append("Low-Conv")
     
-    return " ".join(parts)
+    return " ".join(name_parts)
 ```
 
 ### Uniqueness Guarantee
@@ -829,24 +852,19 @@ def _ensure_unique_name(self, base_name: str, cluster_id: int) -> str:
 ### Architecture
 
 ```
-TacticalAnalyzerGUI (main window)
-  ├─ Frame: Controls
-  │   ├─ Button: Analyze Folder
+TacticalAnalysisGUI (main window)
+  ├─ Control Frame (Top)
   │   ├─ Dropdown: Select Cluster
-  │   ├─ Listbox: Plays in Cluster
-  │   ├─ Button: Visualize Play
-  │   └─ Button: Compare Plays
-  ├─ Frame: Visualization
-  │   └─ Matplotlib Canvas (field plot)
-  └─ Status Label
+  │   ├─ Command Buttons: List, Summary, Compare
+  │   ├─ Input Fields: Play indices for comparison
+  │   └─ Reanalyze: Threshold adjustment + button
+  ├─ Output Frame (Main)
+  │   └─ ScrolledText: Command output display
+  └─ Status Bar (Bottom)
+      └─ Label: Current status
 
-ComparisonWindow (comparison dialog)
-  ├─ Frame: Play 1
-  │   ├─ Matplotlib Canvas (field)
-  │   └─ Text: Event details
-  └─ Frame: Play 2
-      ├─ Matplotlib Canvas (field)
-      └─ Text: Event details
+Note: Uses PlayBrowser for play interactions
+      Visualizations handled by browser.visualize() and browser.compare()
 ```
 
 ### Main Window Implementation
@@ -871,70 +889,57 @@ class TacticalAnalysisGUI:
 
 #### UI Layout
 ```python
-def _setup_ui(self):
-    # Left panel: Controls
-    control_frame = tk.Frame(self.root, width=300)
-    control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+def setup_ui(self):
+    # Top control panel
+    control_frame = ttk.LabelFrame(main_frame, text="Controls", padding="10")
+    control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
     
-    # Analyze button
-    tk.Button(
-        control_frame,
-        text="Analyze Event Folder",
-        command=self.cmd_analyze
-    ).pack(pady=5)
+    # Cluster selection
+    ttk.Label(control_frame, text="Select Cluster:").grid(row=0, column=0)
+    self.cluster_combo = ttk.Combobox(control_frame, state='readonly', width=80)
+    self.cluster_combo.bind('<<ComboboxSelected>>', self.on_cluster_selected)
+    self.cluster_combo.grid(row=0, column=1)
     
-    # Cluster dropdown
-    tk.Label(control_frame, text="Select Cluster:").pack(pady=5)
-    self.cluster_var = tk.StringVar()
-    self.cluster_dropdown = ttk.Combobox(
-        control_frame,
-        textvariable=self.cluster_var,
-        state='readonly'
-    )
-    self.cluster_dropdown.bind('<<ComboboxSelected>>', self.on_cluster_selected)
-    self.cluster_dropdown.pack(pady=5)
+    # Command buttons
+    ttk.Button(control_frame, text="List Plays", 
+              command=self.cmd_list).grid(row=0, column=2)
+    ttk.Button(control_frame, text="Summary", 
+              command=self.cmd_summary).grid(row=0, column=3)
     
-    # Plays listbox
-    tk.Label(control_frame, text="Plays:").pack(pady=5)
-    self.play_listbox = tk.Listbox(control_frame, height=20)
-    self.play_listbox.pack(pady=5, fill=tk.BOTH, expand=True)
+    # Compare inputs
+    self.play1_var = tk.StringVar(value="1")
+    self.play2_var = tk.StringVar(value="2")
+    ttk.Entry(control_frame, textvariable=self.play1_var, width=5).grid(row=1, column=1)
+    ttk.Entry(control_frame, textvariable=self.play2_var, width=5).grid(row=1, column=1)
+    ttk.Button(control_frame, text="Compare Plays", 
+              command=self.cmd_compare).grid(row=1, column=2)
     
-    # Action buttons
-    tk.Button(
-        control_frame,
-        text="Visualize Selected Play",
-        command=self.cmd_visualize
-    ).pack(pady=5)
+    # Reanalysis controls
+    self.threshold_var = tk.StringVar(value="12.0")
+    ttk.Entry(control_frame, textvariable=self.threshold_var, width=10).grid(row=2, column=1)
+    ttk.Button(control_frame, text="Re-analyze", 
+              command=self.cmd_reanalyze).grid(row=2, column=2)
     
-    tk.Button(
-        control_frame,
-        text="Compare Two Plays",
-        command=self.cmd_compare
-    ).pack(pady=5)
+    # Output panel - ScrolledText
+    output_frame = ttk.LabelFrame(main_frame, text="Output", padding="10")
+    output_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
     
-    # Right panel: Visualization
-    viz_frame = tk.Frame(self.root)
-    viz_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
-    
-    # Matplotlib figure
-    self.fig = Figure(figsize=(8, 6))
-    self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
-    self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    self.output_text = scrolledtext.ScrolledText(output_frame, 
+                                                 font=('Consolas', 9),
+                                                 width=120, height=30)
+    self.output_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
     
     # Status bar
-    self.status_label = tk.Label(
-        self.root,
-        text="Ready",
-        relief=tk.SUNKEN,
-        anchor=tk.W
-    )
-    self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
+    self.status_var = tk.StringVar(value="Ready")
+    status_bar = ttk.Label(main_frame, textvariable=self.status_var, 
+                          relief=tk.SUNKEN)
+    status_bar.grid(row=2, column=0, sticky=(tk.W, tk.E))
 ```
 
 **Layout rationale**:
-- **Left panel (300px)**: Fixed width for controls, prevents UI jumping
-- **Right panel**: Expandable for visualization, adapts to window size
-- **Status bar**: Bottom anchored, always visible
+- **Top panel**: Controls for cluster selection and commands
+- **Main panel**: Scrolled text output (120x30 chars, Consolas font)
+- **Status bar**: Bottom anchored, shows current operation
 
 ### Analysis Workflow
 
@@ -987,55 +992,46 @@ def on_cluster_selected(self, event):
 
 **PlayBrowser**: Provides commands like `list()`, `summary()`, `compare(idx1, idx2)`, `visualize(idx)` for exploring plays within a cluster.
 
-#### Step 3: Populate Dropdown
+#### Step 3: Browser Reanalysis
 ```python
-def _populate_cluster_dropdown(self):
-    # Build options with format: "Cluster 1: Wing Attack Fast (15 plays)"
-    options = []
-    for cluster_id in sorted(self.plays_by_cluster.keys()):
-        name = self.cluster_names[cluster_id]
-        count = len(self.plays_by_cluster[cluster_id])
-        options.append(f"Cluster {cluster_id}: {name} ({count} plays)")
-    
-    self.cluster_dropdown['values'] = options
-    
-    # Auto-select first cluster
-    if options:
-        self.cluster_dropdown.current(0)
-        self.on_cluster_selected(None)
+def cmd_reanalyze(self):
+    """Re-run clustering with new threshold."""
+    try:
+        threshold = float(self.threshold_var.get())
+        
+        self.clear_output()
+        self.status_var.set("Re-analyzing...")
+        
+        # Capture stdout
+        old_stdout = sys.stdout
+        sys.stdout = mystdout = StringIO()
+        
+        # Re-cluster with new threshold
+        self.analyzer.reanalyze_with_threshold(threshold)
+        
+        output = mystdout.getvalue()
+        self.print_output(output)
+        
+        # Update dropdown with new clusters
+        cluster_options = []
+        for cluster_id, analysis in self.analyzer.cluster_analysis.items():
+            total = analysis['total']
+            name = analysis['name']
+            cluster_options.append(f"Cluster {cluster_id}: {name} ({total} plays)")
+        
+        self.cluster_combo['values'] = cluster_options
+        if cluster_options:
+            self.cluster_combo.current(0)
+            self.on_cluster_selected(None)
+        
+        self.status_var.set("Re-analysis complete")
+    except ValueError:
+        messagebox.showerror("Error", "Invalid threshold value")
+    finally:
+        sys.stdout = old_stdout
 ```
 
-### Visualization
-
-#### Single Play Visualization
-```python
-def cmd_visualize(self):
-    selection = self.play_listbox.curselection()
-    if not selection:
-        messagebox.showwarning("No Selection", "Please select a play")
-        return
-    
-    # Get selected play
-    cluster_id = self._get_selected_cluster_id()
-    play_idx = selection[0]
-    play = self.plays_by_cluster[cluster_id][play_idx]
-    
-    # Clear previous plot
-    self.fig.clear()
-    
-    # Create visualization
-    visualizer = Visualizer()
-    ax = self.fig.add_subplot(111)
-    visualizer.plot_play(play, ax=ax, title=f"Play {play.play_id}")
-    
-    # Refresh canvas
-    self.canvas.draw()
-```
-
-**Matplotlib integration**:
-- `Figure`: Container for plot
-- `FigureCanvasTkAgg`: Tkinter widget wrapping Figure
-- `canvas.draw()`: Render updated plot
+**Note**: PlayBrowser handles all visualizations internally when its methods are called.
 
 ### Browser Commands
 
@@ -1083,101 +1079,16 @@ def cmd_compare(self):
 
 **Note**: The GUI uses `PlayBrowser` class which provides the actual comparison logic and visualization.
 
-#### Compact Single-Window Design
-```python
-def _create_comparison_window(self, play1: Play, play2: Play):
-    # Create window
-    window = tk.Toplevel(self.root)
-    window.title(f"Compare: {play1.play_id} vs {play2.play_id}")
-    window.geometry("1400x820")
-    
-    # Top frame: Side-by-side field plots
-    field_frame = tk.Frame(window)
-    field_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=False, pady=10)
-    
-    # Compact figure (13 inches wide × 4 inches tall)
-    fig = Figure(figsize=(13, 4), dpi=100)
-    
-    # Left field
-    ax1 = fig.add_subplot(121)
-    self.visualizer.plot_play(play1, ax=ax1, title=f"Play 1: {play1.play_id}")
-    
-    # Right field
-    ax2 = fig.add_subplot(122)
-    self.visualizer.plot_play(play2, ax=ax2, title=f"Play 2: {play2.play_id}")
-    
-    # Embed in Tkinter
-    canvas = FigureCanvasTkAgg(fig, master=field_frame)
-    canvas.get_tk_widget().pack()
-    canvas.draw()
-    
-    # Bottom frame: Event details
-    details_frame = tk.Frame(window)
-    details_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=10, pady=10)
-    
-    # Left details (Play 1)
-    left_frame = tk.Frame(details_frame)
-    left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-    
-    tk.Label(left_frame, text="Play 1 Events:", font=("Arial", 10, "bold")).pack()
-    
-    text1 = tk.Text(left_frame, height=20, width=50, font=("Courier", 7))
-    text1.pack(fill=tk.BOTH, expand=True)
-    text1.insert("1.0", self._build_compact_play_details(play1))
-    text1.config(state=tk.DISABLED)
-    
-    # Right details (Play 2)
-    right_frame = tk.Frame(details_frame)
-    right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5)
-    
-    tk.Label(right_frame, text="Play 2 Events:", font=("Arial", 10, "bold")).pack()
-    
-    text2 = tk.Text(right_frame, height=20, width=50, font=("Courier", 7))
-    text2.pack(fill=tk.BOTH, expand=True)
-    text2.insert("1.0", self._build_compact_play_details(play2))
-    text2.config(state=tk.DISABLED)
-```
+#### Visualization via PlayBrowser
 
-**Layout dimensions**:
-- Total window: 1400×820 pixels
-- Fields: 13×4 inches @ 100 DPI = 1300×400 pixels
-- Details: Remaining vertical space (~420 pixels)
-- Font: Courier 7pt for compact monospaced display
+The GUI doesn't implement visualization directly. Instead, it uses `PlayBrowser` which:
 
-#### Event Details Formatting
-```python
-def _build_compact_play_details(self, play: Play) -> str:
-    lines = []
-    lines.append(f"Play ID: {play.play_id}")
-    lines.append(f"Team: {play.team_id}")
-    lines.append(f"Match: {play.match_id}")
-    lines.append(f"Events: {len(play.events)}")
-    lines.append("-" * 50)
-    
-    for i, event in enumerate(play.events, 1):
-        lines.append(
-            f"{i:2d}. {event.timestamp:6.1f}s | "
-            f"{event.type_name:3s} | "
-            f"({event.location_x:5.1f}, {event.location_y:5.1f}) | "
-            f"Player {event.player_id}"
-        )
-    
-    return "\n".join(lines)
-```
+1. **browser.list()** - Prints formatted list of all plays in cluster
+2. **browser.summary()** - Shows cluster statistics and tactical overview
+3. **browser.compare(idx1, idx2)** - Opens matplotlib windows comparing two plays side-by-side
+4. **browser.visualize(idx)** - Opens matplotlib window for single play visualization
 
-**Example output**:
-```
-Play ID: play_45
-Team: 123
-Match: 3815
-Events: 5
---------------------------------------------------
- 1.  125.3s | PA  | ( 25.0,  34.0) | Player 456
- 2.  127.8s | PA  | ( 45.0,  38.0) | Player 789
- 3.  130.2s | CR  | ( 65.0,  52.0) | Player 123
- 4.  132.7s | PA  | ( 80.0,  60.0) | Player 456
- 5.  135.1s | SH  | ( 95.0,  34.0) | Player 789
-```
+All visualization output (plots and text) is captured from stdout and displayed in the ScrolledText widget, or shown in separate matplotlib windows created by the visualizer module.
 
 ---
 
@@ -1293,7 +1204,7 @@ Only executed on-demand, not a bottleneck
 **Current memory usage**:
 - Events: ~8 bytes × 100,000 = 800 KB
 - Plays: ~200 bytes × 500 = 100 KB
-- Features: 13 × 500 × 8 bytes = 52 KB
+- Features: 17 × 500 × 8 bytes = 68 KB
 - **Total: ~1-2 MB** (negligible)
 
 **No optimization needed** for typical datasets.
@@ -1365,14 +1276,15 @@ def _generate_cache_key(self, folder_path: str) -> str:
 
 ### 1. Why Dataclasses Instead of Plain Dicts?
 
-**Decision**: Use `@dataclass` for Event, Play, Config
+**Decision**: Use `@dataclass` for PlayEvent, Play, MatchMetadata
 
 ```python
 @dataclass
-class Event:
-    event_id: str
-    match_id: str
-    team_id: str
+class PlayEvent:
+    event_type: str
+    time: float
+    ball_x: float
+    ball_y: float
     # ... more fields
 ```
 
@@ -1494,10 +1406,10 @@ Play: Forward pass → 3 passes → shot
 
 **Event Structure**:
 Each event contains:
-- `possessionEvents`: Event type (PA, SH, CR, etc.) and player info
-- `gameEvents`: Team info, time, match metadata
-- `ball`: Ball position (x, y coordinates)
-- `homePlayers`, `awayPlayers`: Player positions for tactical analysis
+- `possessionEvents`: Object with `possessionEventType` (PA, SH, CR, etc.)
+- `gameEvents`: Object with `teamId`, period, and timing info
+- `ball`: Array with ball position objects containing `x`, `y` coordinates
+- Player positions are extracted from event data for tactical features
 
 ### 8. Why Separate Visualizer Class?
 
@@ -1854,21 +1766,21 @@ def cluster_plays(self, plays, features):
 ```python
 # In data_loader.py
 
-def _parse_event(self, event_data: dict) -> Event:
-    location = event_data.get('location', [])
+def _parse_event(self, event_data: dict) -> PlayEvent:
+    ball_data = event_data.get('ball', [])
     
     # Handle missing coordinates
-    if not location or len(location) < 2:
+    if not ball_data or len(ball_data) == 0:
         # Use field center as default
-        location_x = 52.5  # Half of 105m
-        location_y = 34.0  # Half of 68m
+        ball_x = 52.5
+        ball_y = 0.0
     else:
-        location_x = float(location[0])
-        location_y = float(location[1])
+        ball_x = float(ball_data[0].get('x', 52.5))
+        ball_y = float(ball_data[0].get('y', 0.0))
     
-    return Event(
-        location_x=location_x,
-        location_y=location_y,
+    return PlayEvent(
+        ball_x=ball_x,
+        ball_y=ball_y,
         # ... other fields
     )
 ```
@@ -1921,8 +1833,9 @@ def cmd_compare(self):
         )
         return
     
-    # Proceed with comparison
-    self._create_comparison_window(plays[0], plays[1])
+    # Proceed with comparison using PlayBrowser
+    play_ids = [self.get_play_id(idx) for idx in selections]
+    self.browser.compare(*play_ids)
 ```
 
 ### 7. Very Large Datasets
@@ -2017,13 +1930,17 @@ class TestPlayExtraction(unittest.TestCase):
         
         self.assertEqual(len(plays), 0)
     
-    def _create_event(self, event_type, team_id, x, forward=False):
-        """Helper to create test events."""
-        return {
-            'possessionEvents': {'possessionEventType': event_type},
-            'gameEvents': {'teamId': team_id, 'homeTeam': True, 'period': 1},
-            'ball': [{'x': x, 'y': 0}]
-        }
+    def _create_event(self, event_type, team_id, x, y=0, time=0):
+        """Helper to create test PlayEvent objects."""
+        return PlayEvent(
+            event_type=event_type,
+            time=time,
+            ball_x=x,
+            ball_y=y,
+            attacking_players_ahead=0,
+            defending_players_ahead=0,
+            team_id=team_id
+        )
 ```
 
 #### Test Feature Engineering
@@ -2037,13 +1954,21 @@ from src.models import Play, PlayEvent
 class TestFeatureEngineer(unittest.TestCase):
     def test_delta_x_calculation(self):
         """Test forward progression calculation."""
+        # Create normalized events (all attacking left-to-right)
+        normalized = [
+            PlayEvent(event_type='PA', ball_x=20, ball_y=0, time=10, 
+                     attacking_players_ahead=2, defending_players_ahead=3, team_id=1),
+            PlayEvent(event_type='PA', ball_x=60, ball_y=0, time=15,
+                     attacking_players_ahead=3, defending_players_ahead=2, team_id=1)
+        ]
+        
         play = Play(
-            events=[
-                PlayEvent(event_type='PA', ball_x=20, ball_y=0, time=10, ...),
-                PlayEvent(event_type='PA', ball_x=60, ball_y=0, time=15, ...)
-            ],
-            original_attack_direction='R',
-            ...
+            play_id='test', match_id=1, match_name='Test', team_id=1, team_name='Team A',
+            start_time=10, end_time=15, duration=5, events=normalized, 
+            normalized_events=normalized, num_events=2, outcome='ONGOING', is_goal=False,
+            delta_x=0, delta_y=0, max_x=0, total_distance=0,
+            avg_attackers_ahead=0, avg_defenders_ahead=0, wing_side='CENTER',
+            video_url='', start_game_clock=10, end_game_clock=15
         )
         
         engineer = FeatureEngineer()
@@ -2054,13 +1979,20 @@ class TestFeatureEngineer(unittest.TestCase):
     def test_wing_side_detection(self):
         """Test wing vs center classification."""
         # Wing play (|avg_y| > 15)
+        normalized = [
+            PlayEvent(event_type='PA', ball_x=20, ball_y=20, time=10,
+                     attacking_players_ahead=2, defending_players_ahead=3, team_id=1),
+            PlayEvent(event_type='PA', ball_x=40, ball_y=18, time=12,
+                     attacking_players_ahead=3, defending_players_ahead=2, team_id=1)
+        ]
+        
         wing_play = Play(
-            events=[
-                PlayEvent(event_type='PA', ball_x=20, ball_y=20, ...),
-                PlayEvent(event_type='PA', ball_x=40, ball_y=18, ...)
-            ],
-            original_attack_direction='R',
-            ...
+            play_id='test', match_id=1, match_name='Test', team_id=1, team_name='Team A',
+            start_time=10, end_time=12, duration=2, events=normalized,
+            normalized_events=normalized, num_events=2, outcome='ONGOING', is_goal=False,
+            delta_x=0, delta_y=0, max_x=0, total_distance=0,
+            avg_attackers_ahead=0, avg_defenders_ahead=0, wing_side='CENTER',
+            video_url='', start_game_clock=10, end_game_clock=12
         )
         
         engineer = FeatureEngineer()
