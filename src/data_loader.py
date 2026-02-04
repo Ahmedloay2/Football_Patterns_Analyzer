@@ -96,6 +96,9 @@ class EventParser:
                (attack_dir == 'L' and p.get('x', 0) < ball_x - threshold)
         )
         
+        # Ensure at least 1 defender (goalkeeper is always present)
+        defenders_ahead = max(1, defenders_ahead)
+        
         return attackers_ahead, defenders_ahead
     
     def _extract_player_name(self, event_type: str, poss_event: Dict,
@@ -293,6 +296,23 @@ class PlayExtractor:
                 return event['stadiumMetadata']
         return None
     
+    def _normalize_position(self, x_position: float, attack_direction: str) -> float:
+        """Normalize x position to right-attacking coordinates."""
+        if attack_direction == 'R':
+            return x_position
+        else:
+            return -x_position
+    
+    def _is_in_attacking_third(self, x_position: float, attack_direction: str) -> bool:
+        """Check if position is in attacking third."""
+        normalized_x = self._normalize_position(x_position, attack_direction)
+        return normalized_x >= self.config.attacking_third_min
+    
+    def _is_in_defensive_third(self, x_position: float, attack_direction: str) -> bool:
+        """Check if position is in defensive third."""
+        normalized_x = self._normalize_position(x_position, attack_direction)
+        return normalized_x <= self.config.defensive_third_max
+    
     def _is_pass_forward(self, event: Dict, all_events: List[Dict], 
                         event_idx: int, stadium_meta: Dict,
                         team_id: int, period: int, is_home: bool) -> bool:
@@ -344,6 +364,28 @@ class PlayExtractor:
         
         # Determine attack direction
         original_attack_dir = determine_attack_direction(is_home, period, stadium_meta)
+        
+        # Check if play ends in attacking third (use normalized coordinates)
+        last_ball_x = play_events[-1].ball_x
+        last_normalized_x = self._normalize_position(last_ball_x, original_attack_dir)
+        
+        # Must end in attacking third (x >= 16.67 in normalized coords)
+        if last_normalized_x < self.config.attacking_third_min:
+            return None
+        
+        # Additional check: must reach deep into attacking third (x >= 20)
+        if last_normalized_x < 20.0:
+            return None
+        
+        # Check if play starts in defensive third (exclude defensive clearances)
+        first_ball_x = play_events[0].ball_x
+        first_normalized_x = self._normalize_position(first_ball_x, original_attack_dir)
+        
+        if first_normalized_x <= self.config.defensive_third_max:
+            # Only accept if there's significant forward progress
+            forward_progress = last_normalized_x - first_normalized_x
+            if forward_progress < self.config.min_forward_progress:
+                return None
         
         # Timing
         start_time = play_events[0].time

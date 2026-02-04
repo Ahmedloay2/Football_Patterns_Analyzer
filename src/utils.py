@@ -48,12 +48,14 @@ def get_feature_vector(play: Play) -> np.ndarray:
     Extract feature vector for clustering.
     
     Focus on structural patterns:
-    - Event sequence and types
-    - Spatial progression
-    - Tactical positioning
+    - Event sequence and types (8 dimensions)
+    - Spatial progression (6 dimensions)
+    - Starting position (2 dimensions)
+    - Trajectory shape (2 dimensions)
+    - Tactical positioning (3 dimensions)
     
     Returns:
-        Feature vector as numpy array
+        Feature vector as numpy array (21 dimensions total)
     """
     features = []
     
@@ -67,6 +69,9 @@ def get_feature_vector(play: Play) -> np.ndarray:
     
     features.extend([event_counts[et] for et in event_types])
     
+    # Get events for position calculations
+    events = play.normalized_events
+    
     # Spatial features
     features.extend([
         play.delta_x,
@@ -76,6 +81,33 @@ def get_feature_vector(play: Play) -> np.ndarray:
         play.num_events,
         play.duration
     ])
+    
+    # Starting position features (to distinguish wing vs center starts)
+    if events:
+        start_x = events[0].ball_x
+        start_y = abs(events[0].ball_y)
+        features.extend([
+            start_x,
+            start_y
+        ])
+    else:
+        features.extend([0.0, 0.0])
+    
+    # Trajectory shape features
+    if len(events) >= 2:
+        # Y-axis variance (how much lateral movement)
+        y_positions = [e.ball_y for e in events]
+        y_variance = np.var(y_positions)
+        
+        # Final position y (where it ends laterally)
+        final_y = abs(events[-1].ball_y)
+        
+        features.extend([
+            y_variance,
+            final_y
+        ])
+    else:
+        features.extend([0.0, 0.0])
     
     # Tactical features
     features.extend([

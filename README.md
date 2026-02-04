@@ -39,17 +39,28 @@ This system analyzes football match event data to:
 A **play** is defined as a sequence of events by a single team that:
 - **Starts** with a forward pass (PA event)
 - **Contains** at least 2 passes (PA or CR - cross events)
+- **Ends in the attacking third** (final ball position must be x ≥ 20 in normalized coordinates)
 - **Ends** with a terminal event:
   - Possession lost (team changes, LO, CA, TA events)
   - Shot taken (SH event - may result in GOAL)
 - **Same team** maintains possession throughout
 - **Intermediate events** (dribbles, touches, etc.) are included but don't count toward the pass requirement
+- **Minimum forward progress** if starting in defensive third (≥5 meters)
+
+**Field Positioning:**
+The system divides the pitch into three zones:
+- **Defensive third**: x ≤ -16.67 (own half defensive zone)
+- **Middle third**: -16.67 < x < 16.67 (midfield zone)
+- **Attacking third**: x ≥ 16.67 (opponent's defensive zone)
+
+Only plays ending in the attacking third are extracted to focus on genuine attacking patterns.
 
 **Example Play:**
 ```
-Pass (PA) → Dribble (DR) → Pass (PA) → Touch (IT) → Shot (SH) ✓ VALID (2 passes + shot)
-Pass (PA) → Pass (PA) → Team Change ✓ VALID (2 passes + possession lost)
+Pass (PA) → Dribble (DR) → Pass (PA) → Touch (IT) → Shot (SH) at x=25 ✓ VALID (2 passes + shot in attacking third)
+Pass (PA) → Pass (PA) → Team Change at x=22 ✓ VALID (2 passes + possession lost in attacking third)
 Pass (PA) → Shot (SH) ✗ INVALID (only 1 pass)
+Pass (PA) → Pass (PA) → Shot (SH) at x=10 ✗ INVALID (not in attacking third)
 ```
 
 ---
@@ -252,56 +263,67 @@ This definition captures **meaningful attacking sequences**:
 
 ### Features Calculated (`src/feature_engineer.py`)
 
-The system calculates **13 features** per play grouped into 4 categories:
+The system calculates **21 features** per play grouped into 5 categories:
 
-#### 1. **Spatial Features**
+#### 1. **Event Type Counts** (8 dimensions)
+One-hot encoding of common event types:
+- PA (Pass), SH (Shot), CR (Cross), IT (Interception/Touch)
+- LO (Loss), CA (Clearance), DR (Dribble), TC (Touch)
+
+#### 2. **Spatial Features** (6 dimensions)
 | Feature | Description | Calculation | Tactical Meaning |
 |---------|-------------|-------------|------------------|
 | `delta_x` | Forward progress | `final_x - initial_x` | Penetration depth |
-| `delta_y` | Lateral movement | `final_y - initial_y` | Width of attack |
+| `delta_y` | Lateral movement | `abs(final_y - initial_y)` | Width of attack |
 | `max_x` | Deepest penetration | `max(all_x_coords)` | Threat level |
 | `total_distance` | Ball travel distance | `Σ√(Δx² + Δy²)` | Play complexity |
+| `num_events` | Event count | Integer | Play length |
+| `duration` | Play length | Seconds | Tempo |
 
-#### 2. **Temporal Features**
-| Feature | Description | Unit | Range |
-|---------|-------------|------|-------|
-| `duration` | Play length | Seconds | 3-30 |
-| `num_events` | Event count | Integer | 2+ |
+#### 3. **Starting Position Features** (2 dimensions)
+| Feature | Description | Tactical Use |
+|---------|-------------|-------------|
+| `start_x` | Horizontal starting position | Identifies build-up zone |
+| `start_y` | Absolute lateral starting position | Distinguishes wing vs center starts |
 
-#### 3. **Tactical Features**
+#### 4. **Trajectory Shape Features** (2 dimensions)
+| Feature | Description | Calculation | Meaning |
+|---------|-------------|-------------|----------|
+| `y_variance` | Lateral movement variance | `var(all_y_coords)` | Straight vs diagonal path |
+| `final_y` | Ending lateral position | `abs(final_y)` | Wing vs center finish |
+
+#### 5. **Tactical Features** (3 dimensions)
 | Feature | Description | Calculation | Use |
 |---------|-------------|-------------|-----|
 | `avg_attackers_ahead` | Offensive support | `mean(attackers ahead of ball)` | Formation analysis |
-| `avg_defenders_ahead` | Defensive pressure | `mean(defenders ahead of ball)` | Resistance level |
+| `avg_defenders_ahead` | Defensive pressure | `max(1, mean(defenders ahead))` | Resistance level (min 1 for GK) |
 | `wing_side` | Attack position | `'WING' if abs(y) > 15 else 'CENTER'` | Positional categorization |
 
-#### 4. **Outcome Features**
-| Feature | Description | Values |
-|---------|-------------|--------|
-| `outcome` | Final result | GOAL, SHOT, POSSESSION_LOST, LOSS, TURNOVER |
-| `is_goal` | Scoring flag | Boolean |
+**Note:** The `avg_defenders_ahead` is guaranteed to be at least 1, accounting for the goalkeeper who is always present.
 
 ### Feature Vector Construction
 
-For clustering, features are normalized and combined:
+For clustering, features are combined into a **21-dimensional vector**:
 
 ```python
 def get_feature_vector(play):
     """
-    13-dimensional feature vector for clustering.
+    21-dimensional feature vector for clustering.
     """
     return np.array([
-        play.delta_x,              # Forward progress
-        play.delta_y,              # Lateral movement
-        play.total_distance,       # Total distance
-        play.duration,             # Time length
-        play.num_events,           # Event count
-        play.avg_attackers_ahead,  # Offensive support
-        play.avg_defenders_ahead,  # Defensive pressure
-        play.max_x,                # Maximum penetration
-        1 if play.is_goal else 0,  # Scoring outcome
-        1 if play.wing_side == 'WING' else 0,  # Position
-        # ... (normalized values)
+        # Event type counts (8)
+        count_PA, count_SH, count_CR, count_IT,
+        count_LO, count_CA, count_DR, count_TC,
+        # Spatial features (6)
+        play.delta_x, play.delta_y, play.max_x,
+        play.total_distance, play.num_events, play.duration,
+        # Starting position (2)
+        start_x, start_y,
+        # Trajectory shape (2)
+        y_variance, final_y,
+        # Tactical features (3)
+        play.avg_attackers_ahead, play.avg_defenders_ahead,
+        1.0 if play.wing_side == 'WING' else 0.0
     ])
 ```
 
@@ -989,3 +1011,4 @@ def calculate_similarity(play1, play2) -> float:
    - Evolution of patterns over season
    - Success rate prediction
 
+---

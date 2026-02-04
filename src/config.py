@@ -18,6 +18,13 @@ class AnalysisConfig:
     # Thresholds
     ahead_threshold: float = 1.0  # meters
     forward_threshold: float = 1.0  # meters
+    
+    # Field position constants (pitch divided into thirds)
+    # Assuming pitch is -50 to +50 in x-axis (100 meters total)
+    defensive_third_max: float = -16.67  # -50 to -16.67
+    middle_third_max: float = 16.67      # -16.67 to 16.67
+    attacking_third_min: float = 16.67   # 16.67 to 50
+    deep_attacking_min: float = 20.0     # Minimum for deep attacking play
 
 
 @dataclass

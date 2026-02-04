@@ -64,10 +64,10 @@ class TacticalAnalysisGUI:
         self.play2_var = tk.StringVar(value="2")
         
         ttk.Entry(control_frame, textvariable=self.play1_var, 
-                 width=5).grid(row=1, column=1, padx=5, sticky=tk.W)
+                 width=15).grid(row=1, column=1, padx=5, sticky=tk.W)
         ttk.Label(control_frame, text="vs").grid(row=1, column=1, padx=50)
         ttk.Entry(control_frame, textvariable=self.play2_var, 
-                 width=5).grid(row=1, column=1, padx=5, sticky=tk.E)
+                 width=15).grid(row=1, column=1, padx=5, sticky=tk.E)
         
         ttk.Button(control_frame, text="Compare Plays", 
                   command=self.cmd_compare).grid(row=1, column=2, padx=5)

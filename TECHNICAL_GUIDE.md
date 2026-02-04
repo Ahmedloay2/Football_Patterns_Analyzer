@@ -188,15 +188,38 @@ A play must satisfy ALL of these conditions:
 1. **Initiation**: Starts with a forward pass (PA event type)
 2. **Forward Direction**: First pass must move ball forward in attack direction
 3. **Continuation**: Contains at least 2 passes (PA or CR events) by the same team
-4. **Termination**: Ends with a terminal event:
+4. **Attacking Third Filter**: Final ball position must be in the attacking third (normalized x ≥ 16.67)
+5. **Deep Penetration**: Final ball position must reach deep attacking zone (normalized x ≥ 20.0)
+6. **Termination**: Ends with a terminal event:
    - SH (Shot) - attacking attempt
    - LO (Loss Offensive) - possession lost
    - CA (Clearance) - defensive action
    - TA (Tackle) - defensive action
    - Team change - opponent gains possession
-5. **Team Consistency**: All events must be by the same team until termination
-6. **Duration**: Must be between 3-30 seconds (configurable)
-7. **Forward Progress**: After normalization, must have minimum forward progress (>5.0 units, configurable)
+7. **Team Consistency**: All events must be by the same team until termination
+8. **Duration**: Must be between 3-30 seconds (configurable)
+9. **Forward Progress**: If starting in defensive third, must have minimum forward progress (≥5.0 units, configurable)
+10. **Defensive Filter**: Plays starting in defensive third without significant forward progress are excluded
+
+### Field Division into Thirds
+
+The pitch is divided into three equal zones (assuming -50 to +50 coordinate system):
+
+```
+  Defensive Third    |    Middle Third    |   Attacking Third
+   (-50 to -16.67)   |  (-16.67 to 16.67) |   (16.67 to 50)
+        Own Goal     |      Midfield      |    Opponent Goal
+```
+
+**Configuration** (from `config.py`):
+```python
+defensive_third_max: float = -16.67
+middle_third_max: float = 16.67
+attacking_third_min: float = 16.67
+deep_attacking_min: float = 20.0  # Stricter threshold for filtering
+```
+
+**Rationale**: This ensures only genuine attacking plays that penetrate into dangerous areas are analyzed.
 
 ### Algorithm Implementation
 
@@ -341,27 +364,31 @@ Result: ❌ Invalid (first pass not forward)
 ## Feature Engineering - Mathematical Foundation
 
 ### Feature Vector Composition
-Each play is transformed into a **17-dimensional feature vector** (as detailed above).
+Each play is transformed into a **21-dimensional feature vector**.
 
 The features focus on:
 1. **Event sequence** - What types of actions occurred (8 event type counts)
-2. **Spatial dynamics** - Movement patterns and distances (6 spatial features)  
-3. **Tactical context** - Player positioning (3 tactical features)
+2. **Spatial dynamics** - Movement patterns and distances (6 spatial features)
+3. **Starting position** - Where the play began (2 features)
+4. **Trajectory shape** - Path characteristics (2 features)
+5. **Tactical context** - Player positioning (3 tactical features)
 
 **Example feature vector**:
 ```python
 play = Play(...)
 vector = get_feature_vector(play)
-# Returns: [2, 1, 0, 1, 0, 0, 0, 0,  # Event counts
-#           45.2, 12.3, 52.0, 68.4, 6, 8.2,  # Spatial
-#           3.5, 4.2, 0.0]  # Tactical
+# Returns: [2, 1, 0, 1, 0, 0, 0, 0,  # Event counts (8)
+#           45.2, 12.3, 52.0, 68.4, 6, 8.2,  # Spatial (6)
+#           -10.5, 8.3,  # Starting position (2)
+#           15.7, 12.1,  # Trajectory shape (2)
+#           3.5, 4.2, 0.0]  # Tactical (3)
 ```
 
 ### Feature Definitions
 
 #### Feature Vector Structure
 
-The actual feature vector consists of **17 dimensions**:
+The actual feature vector consists of **21 dimensions**:
 
 **Event Type Counts (8 dimensions)**:
 - PA (Pass Accurate) count
@@ -381,9 +408,17 @@ The actual feature vector consists of **17 dimensions**:
 - num_events: Number of events in play
 - duration: Time elapsed (seconds)
 
+**Starting Position Features (2 dimensions)**:
+- start_x: Horizontal starting position (identifies build-up zone)
+- start_y: Absolute lateral starting position (distinguishes wing vs center starts)
+
+**Trajectory Shape Features (2 dimensions)**:
+- y_variance: Variance of y-coordinates (straight vs diagonal movement)
+- final_y: Absolute ending lateral position (wing vs center finish)
+
 **Tactical Features (3 dimensions)**:
 - avg_attackers_ahead: Mean attacking players ahead of ball
-- avg_defenders_ahead: Mean defending players ahead of ball
+- avg_defenders_ahead: Mean defending players ahead of ball (minimum 1 for goalkeeper)
 - wing_indicator: 1.0 if wing play, 0.0 if central
 
 #### Coordinate System
@@ -429,21 +464,70 @@ def _process_play(self, play: Play) -> None:
     play.wing_side = 'WING' if mean([abs(e.ball_y) for e in events]) > 15 else 'CENTER'
 ```
 
+**From utils.py - get_feature_vector()**:
+
+```python
+def get_feature_vector(play: Play) -> np.ndarray:
+    # Event type counts (8)
+    event_counts = count_event_types(play.normalized_events)
+    
+    # Spatial features (6)
+    spatial = [play.delta_x, play.delta_y, play.max_x,
+               play.total_distance, play.num_events, play.duration]
+    
+    # Starting position features (2)
+    start_x = play.normalized_events[0].ball_x
+    start_y = abs(play.normalized_events[0].ball_y)
+    
+    # Trajectory shape features (2)
+    y_positions = [e.ball_y for e in play.normalized_events]
+    y_variance = np.var(y_positions)
+    final_y = abs(play.normalized_events[-1].ball_y)
+    
+    # Tactical features (3)
+    tactical = [play.avg_attackers_ahead,
+                play.avg_defenders_ahead,  # Minimum 1 (goalkeeper)
+                1.0 if play.wing_side == 'WING' else 0.0]
+    
+    return np.array(event_counts + spatial + [start_x, start_y] +
+                    [y_variance, final_y] + tactical)
+```
+
+**Goalkeeper Handling** (from data_loader.py):
+```python
+def _count_players_ahead(self, event: Dict, ball_x: float, ...) -> tuple:
+    # Count defenders ahead of ball
+    defenders_ahead = sum(
+        1 for p in defending_players
+        if (attack_dir == 'R' and p.get('x', 0) > ball_x + threshold) or
+           (attack_dir == 'L' and p.get('x', 0) < ball_x - threshold)
+    )
+    
+    # Ensure at least 1 defender (goalkeeper is always present)
+    defenders_ahead = max(1, defenders_ahead)
+    
+    return attackers_ahead, defenders_ahead
+```
+
 ### Feature Engineering Details
 
 **Actual features** (from `utils.py` - `get_feature_vector()`):
 
 1. **Event Type Counts** (8 features): PA, SH, CR, IT, LO, CA, DR, TC
 2. **Spatial Features** (6 features): delta_x, delta_y, max_x, total_distance, num_events, duration
-3. **Tactical Features** (3 features): avg_attackers_ahead, avg_defenders_ahead, wing_indicator (1.0 or 0.0)
+3. **Starting Position** (2 features): start_x, start_y
+4. **Trajectory Shape** (2 features): y_variance, final_y
+5. **Tactical Features** (3 features): avg_attackers_ahead, avg_defenders_ahead, wing_indicator (1.0 or 0.0)
 
-**Total**: 17 features per play
+**Total**: 21 features per play
 
 **Normalization**: Features are used in raw form (not standardized). Ward's linkage naturally handles different scales.
 
 **Why these features?**
 - Event type sequence captures tactical approach (passing vs crossing vs dribbling)
 - Spatial features capture movement patterns and penetration
+- Starting position distinguishes wing vs center build-up zones
+- Trajectory shape captures straight vs diagonal paths
 - Tactical features capture numerical advantage and positioning
 - Outcome (goal/shot) is NOT included in features - clustering based on pattern, not result
 
